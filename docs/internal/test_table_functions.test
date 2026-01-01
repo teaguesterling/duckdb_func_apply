@@ -1,0 +1,73 @@
+# test/sql/functools/test_table_functions.test
+# Tests for apply_table() and apply_table_with()
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Basic table function - range
+query I
+SELECT * FROM apply_table('range', 5);
+----
+0
+1
+2
+3
+4
+
+# With generate_series
+query I
+SELECT * FROM apply_table('generate_series', 1, 5);
+----
+1
+2
+3
+4
+5
+
+# With unnest
+query I
+SELECT * FROM apply_table('unnest', [10, 20, 30]);
+----
+10
+20
+30
+
+# apply_table_with with args
+query I
+SELECT * FROM apply_table_with('range', args := [10]);
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+# Aggregation on results
+query I
+SELECT count(*) FROM apply_table('range', 100);
+----
+100
+
+query I
+SELECT sum(column0) FROM apply_table('range', 10);
+----
+45
+
+# Error: function not found
+statement error
+SELECT * FROM apply_table('nonexistent', 'arg');
+----
+Function 'nonexistent' not found
+
+# Error: null function name
+statement error
+SELECT * FROM apply_table(NULL, 5);
+----
+function name cannot be NULL

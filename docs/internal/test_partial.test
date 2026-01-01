@@ -1,0 +1,272 @@
+# test/sql/functools/partial.test
+# Tests for partial() - creating partial function descriptors
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Basic partial with fixed positional args
+query T
+SELECT partial('concat', ['https://']);
+----
+{'func': concat, 'fixed_args': [https://], 'fixed_kwargs': {}}
+
+# Use partial with apply_with
+query T
+SELECT apply_with(
+    partial('concat', ['https://']),
+    args := ['example.com']
+);
+----
+https://example.com
+
+# Partial with multiple fixed args
+query T
+SELECT apply_with(
+    partial('substr', ['hello world', 7]),
+    args := [5]
+);
+----
+world
+
+# Partial with fixed kwargs
+query T
+SELECT apply_with(
+    partial('substr', [], {'start': 7}),
+    args := ['hello world'],
+    kwargs := {'length': 5}
+);
+----
+world
+
+# Partial with both fixed args and kwargs
+query T
+SELECT apply_with(
+    partial('substr', ['hello world'], {'start': 7}),
+    kwargs := {'length': 5}
+);
+----
+world
+
+# Empty partial (no fixed args/kwargs)
+query T
+SELECT partial('upper', [], {});
+----
+{'func': upper, 'fixed_args': [], 'fixed_kwargs': {}}
+
+query T
+SELECT apply_with(partial('upper', [], {}), args := ['hello']);
+----
+HELLO
+
+# Store partials in table
+statement ok
+CREATE TABLE url_builders (
+    name VARCHAR,
+    builder STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO url_builders VALUES
+    ('https', partial('concat', ['https://'])),
+    ('http', partial('concat', ['http://'])),
+    ('ftp', partial('concat', ['ftp://']));
+
+query TT
+SELECT name, apply_with(builder, args := ['example.com'])
+FROM url_builders
+ORDER BY name;
+----
+ftp	ftp://example.com
+http	http://example.com
+https	https://example.com
+
+statement ok
+DROP TABLE url_builders;
+
+# Compose partials (partial of partial application)
+query T
+SELECT apply_with(
+    partial('concat', ['prefix_']),
+    args := [apply_with(
+        partial('concat', ['https://']),
+        args := ['example.com']
+    )]
+);
+----
+prefix_https://example.com
+
+# Partial for data transformation
+statement ok
+CREATE TABLE transformers (
+    name VARCHAR,
+    transform STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO transformers VALUES
+    ('uppercase', partial('upper', [])),
+    ('remove_spaces', partial('replace', [], {'pattern': ' ', 'replacement': ''})),
+    ('add_prefix', partial('concat', ['PREFIX_']));
+
+statement ok
+CREATE TABLE raw_data (value VARCHAR);
+
+statement ok
+INSERT INTO raw_data VALUES ('hello'), ('world'), ('duck db');
+
+query T
+SELECT apply_with(
+    (SELECT transform FROM transformers WHERE name = 'uppercase'),
+    args := [value]
+)
+FROM raw_data
+ORDER BY value;
+----
+DUCK DB
+HELLO
+WORLD
+
+statement ok
+DROP TABLE transformers;
+
+statement ok
+DROP TABLE raw_data;
+
+# Partial with list functions
+query T
+SELECT apply_with(
+    partial('list_transform', [], {'func': 'x -> x * 2'}),
+    args := [[1, 2, 3, 4, 5]]
+);
+----
+[2, 4, 6, 8, 10]
+
+# Multiple partials in a list
+query T
+SELECT list_transform(
+    [partial('concat', ['a_']), partial('concat', ['b_']), partial('concat', ['c_'])],
+    p -> apply_with(p, args := ['test'])
+);
+----
+[a_test, b_test, c_test]
+
+# Partial with middleware pattern
+statement ok
+CREATE TABLE middleware (
+    step INTEGER,
+    mw STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO middleware VALUES
+    (1, partial('concat', ['[auth] '])),
+    (2, partial('concat', ['[log] '])),
+    (3, partial('concat', ['[process] ']));
+
+query T
+SELECT list_reduce(
+    (SELECT list(mw ORDER BY step) FROM middleware),
+    (text, middleware) -> apply_with(middleware, args := [text]),
+    'REQUEST'
+);
+----
+[process] [log] [auth] REQUEST
+
+statement ok
+DROP TABLE middleware;
+
+# Partial with complex kwargs
+query T
+SELECT apply_with(
+    partial('json_extract', [], {'path': '$.name'}),
+    args := ['{"name": "Alice", "age": 30}'::JSON]
+);
+----
+"Alice"
+
+# Store and retrieve partials
+statement ok
+CREATE TABLE config (
+    key VARCHAR,
+    handler STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO config VALUES
+    ('normalize', partial('regexp_replace', [], {
+        'pattern': '\s+',
+        'replacement': ' ',
+        'modifiers': 'g'
+    }));
+
+query T
+SELECT apply_with(
+    (SELECT handler FROM config WHERE key = 'normalize'),
+    args := ['hello    world   test']
+);
+----
+hello world test
+
+statement ok
+DROP TABLE config;
+
+# Null handling in partial
+query T
+SELECT partial('concat', [NULL, 'suffix']);
+----
+{'func': concat, 'fixed_args': [NULL, suffix], 'fixed_kwargs': {}}
+
+query T
+SELECT apply_with(
+    partial('concat', [NULL, 'suffix']),
+    args := ['prefix']
+);
+----
+NULL
+
+# Empty args array
+query T
+SELECT partial('pi', []);
+----
+{'func': pi, 'fixed_args': [], 'fixed_kwargs': {}}
+
+query R
+SELECT apply_with(partial('pi', []), args := []);
+----
+3.141592653589793
+
+# Error: Null function name
+statement error
+SELECT partial(NULL, ['arg']);
+----
+function name cannot be NULL
+
+# Error: Invalid args type (not array)
+statement error
+SELECT partial('upper', 'not_an_array');
+----
+args must be an array
+
+# Error: Invalid kwargs type (not struct)
+statement error
+SELECT partial('upper', [], 'not_a_struct');
+----
+kwargs must be a struct
+
+# Error: Function doesn't exist (but partial still created)
+# Note: partial doesn't validate function existence, only apply does
+query T
+SELECT partial('nonexistent_function', ['arg']);
+----
+{'func': nonexistent_function, 'fixed_args': [arg], 'fixed_kwargs': {}}
+
+# But using it will fail
+statement error
+SELECT apply_with(
+    partial('nonexistent_function', ['arg']),
+    args := []
+);
+----
+Function 'nonexistent_function' not found

@@ -1,0 +1,279 @@
+# test/sql/functools/chaining.test
+# Tests for function chaining with apply() and apply_with()
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Basic chaining with apply()
+query T
+SELECT ('upper').apply('hello');
+----
+HELLO
+
+query T
+SELECT ('trim').apply('  hello  ');
+----
+hello
+
+query T
+SELECT ('substr').apply('hello world', 7, 5);
+----
+world
+
+# Multiple args with chaining
+query T
+SELECT ('concat').apply('hello', ' ', 'world');
+----
+hello world
+
+query T
+SELECT ('replace').apply('hello world', 'world', 'duckdb');
+----
+hello duckdb
+
+# Chaining with numbers
+query I
+SELECT ('abs').apply(-42);
+----
+42
+
+query R
+SELECT ('round').apply(3.14159, 2);
+----
+3.14
+
+# Chaining with dates
+query I
+SELECT ('date_part').apply('year', DATE '2024-01-15');
+----
+2024
+
+# Chaining with lists
+query T
+SELECT ('list_value').apply(1, 2, 3, 4, 5);
+----
+[1, 2, 3, 4, 5]
+
+# Chaining results (nested application)
+query T
+SELECT ('upper').apply(
+    ('substr').apply('hello world', 7, 5)
+);
+----
+WORLD
+
+query T
+SELECT ('reverse').apply(
+    ('upper').apply(
+        ('trim').apply('  hello  ')
+    )
+);
+----
+OLLEH
+
+# Chaining with apply_with()
+query T
+SELECT ('upper').apply_with(args := ['hello']);
+----
+HELLO
+
+query T
+SELECT ('substr').apply_with(
+    args := ['hello world'],
+    kwargs := {'start': 7, 'length': 5}
+);
+----
+world
+
+# Chaining with only kwargs
+query T
+SELECT ('substr').apply_with(
+    kwargs := {'string': 'hello world', 'start': 7, 'length': 5}
+);
+----
+world
+
+# Chaining with partial descriptors
+query T
+SELECT (partial('concat', ['https://'])).apply_with(
+    args := ['example.com']
+);
+----
+https://example.com
+
+# Chaining from table results
+statement ok
+CREATE TABLE funcs (name VARCHAR);
+
+statement ok
+INSERT INTO funcs VALUES ('upper'), ('lower'), ('reverse');
+
+query TT
+SELECT name, (name).apply('hello')
+FROM funcs
+ORDER BY name;
+----
+lower	hello
+reverse	olleh
+upper	HELLO
+
+statement ok
+DROP TABLE funcs;
+
+# Chaining in WHERE clause
+statement ok
+CREATE TABLE data (id INTEGER, text VARCHAR);
+
+statement ok
+INSERT INTO data VALUES
+    (1, 'hello'),
+    (2, 'WORLD'),
+    (3, 'DuckDB');
+
+query IT
+SELECT id, text
+FROM data
+WHERE ('upper').apply(text) = 'HELLO'
+ORDER BY id;
+----
+1	hello
+
+statement ok
+DROP TABLE data;
+
+# Chaining with aggregates
+statement ok
+CREATE TABLE numbers (value INTEGER);
+
+statement ok
+INSERT INTO numbers VALUES (1), (2), (3), (4), (5);
+
+query I
+SELECT ('sum').apply(('list_aggr').apply(value))
+FROM numbers;
+----
+15
+
+statement ok
+DROP TABLE numbers;
+
+# Complex chaining example
+query T
+SELECT ('concat').apply(
+    'Result: ',
+    ('upper').apply(
+        ('substr').apply(
+            ('trim').apply('  hello world  '),
+            7,
+            5
+        )
+    )
+);
+----
+Result: WORLD
+
+# Chaining with type casts
+query I
+SELECT ('CAST').apply('42', 'INTEGER');
+----
+42
+
+# Chaining with string literals (requires parentheses)
+query T
+SELECT ('hello').upper();
+----
+HELLO
+
+query T
+SELECT ('  hello  ').trim().upper();
+----
+HELLO
+
+# Chaining apply on string method results
+query T
+SELECT 'hello'.upper().('reverse').apply();
+----
+OLLEH
+
+# Mixed chaining: native DuckDB + apply
+query T
+SELECT ('hello world').substr(7, 5).('upper').apply();
+----
+WORLD
+
+# Error: Cannot chain on NULL
+statement error
+SELECT (NULL).apply('test');
+----
+function name cannot be NULL
+
+# Error: Invalid function in chain
+statement error
+SELECT ('nonexistent').apply('arg');
+----
+Function 'nonexistent' not found
+
+# Chaining with batch operations
+statement ok
+CREATE TABLE operations (func VARCHAR, arg VARCHAR);
+
+statement ok
+INSERT INTO operations VALUES
+    ('upper', 'hello'),
+    ('lower', 'WORLD'),
+    ('reverse', 'test');
+
+query TT
+SELECT func, (func).apply(arg)
+FROM operations
+ORDER BY func;
+----
+lower	world
+reverse	tset
+upper	HELLO
+
+statement ok
+DROP TABLE operations;
+
+# Chaining in CTEs
+query T
+WITH transformed AS (
+    SELECT ('trim').apply('  hello  ') as step1
+)
+SELECT ('upper').apply(step1)
+FROM transformed;
+----
+HELLO
+
+# Chaining in subqueries
+query T
+SELECT ('concat').apply(
+    'Prefix: ',
+    (SELECT ('upper').apply('value'))
+);
+----
+Prefix: VALUE
+
+# Chaining with window functions
+statement ok
+CREATE TABLE seq (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO seq VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+query IIT
+SELECT 
+    id,
+    ('upper').apply(val) as upper_val,
+    ('concat').apply(val, '_suffix') as with_suffix
+FROM seq
+ORDER BY id;
+----
+1	A	a_suffix
+2	B	b_suffix
+3	C	c_suffix
+
+statement ok
+DROP TABLE seq;

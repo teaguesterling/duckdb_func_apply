@@ -1,0 +1,360 @@
+# test/sql/functools/url_routing.test
+# Tests for URL routing use case with functools
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Create mock URL pattern functions for testing
+# (In real usage, these would come from duckdb_urlpattern extension)
+statement ok
+CREATE FUNCTION url_pattern_test(pattern VARCHAR, url VARCHAR) AS
+    CASE
+        WHEN pattern = '/users/:id' THEN url LIKE '/users/%'
+        WHEN pattern = '/posts/:tag/:date' THEN url LIKE '/posts/%/%'
+        WHEN pattern = '/api/v1/*' THEN url LIKE '/api/v1/%'
+        WHEN pattern = '/api/v2/*' THEN url LIKE '/api/v2/%'
+        ELSE false
+    END;
+
+statement ok
+CREATE FUNCTION url_pattern_extract(pattern VARCHAR, url VARCHAR) AS
+    CASE
+        WHEN pattern = '/users/:id' THEN {'id': split_part(url, '/', 3)}
+        WHEN pattern = '/posts/:tag/:date' THEN {
+            'tag': split_part(url, '/', 3),
+            'date': split_part(url, '/', 4)
+        }
+        WHEN pattern = '/api/v1/*' THEN {'path': substr(url, 9)}
+        WHEN pattern = '/api/v2/*' THEN {'path': substr(url, 9)}
+        ELSE {}
+    END;
+
+# Create handler functions
+statement ok
+CREATE FUNCTION get_user(params STRUCT) AS 
+    'User ID: ' || params.id;
+
+statement ok
+CREATE FUNCTION get_post(params STRUCT) AS
+    'Post - Tag: ' || params.tag || ', Date: ' || params.date;
+
+statement ok
+CREATE FUNCTION handle_api_v1(params STRUCT) AS
+    'API v1 - Path: ' || params.path;
+
+statement ok
+CREATE FUNCTION handle_api_v2(params STRUCT) AS
+    'API v2 - Path: ' || params.path;
+
+# Test 1: Basic routing with apply_with
+statement ok
+CREATE TABLE routes (
+    pattern VARCHAR,
+    handler VARCHAR
+);
+
+statement ok
+INSERT INTO routes VALUES
+    ('/users/:id', 'get_user'),
+    ('/posts/:tag/:date', 'get_post');
+
+# Route a user request
+query T
+SELECT apply_with(
+    handler,
+    args := [url_pattern_extract(pattern, '/users/123')]
+)
+FROM routes
+WHERE url_pattern_test(pattern, '/users/123')
+LIMIT 1;
+----
+User ID: 123
+
+# Route a post request
+query T
+SELECT apply_with(
+    handler,
+    args := [url_pattern_extract(pattern, '/posts/tech/2024-01-15')]
+)
+FROM routes
+WHERE url_pattern_test(pattern, '/posts/tech/2024-01-15')
+LIMIT 1;
+----
+Post - Tag: tech, Date: 2024-01-15
+
+statement ok
+DROP TABLE routes;
+
+# Test 2: Routing with partial descriptors (pre-configured handlers)
+statement ok
+CREATE TABLE routes_v2 (
+    pattern VARCHAR,
+    handler STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO routes_v2 VALUES
+    (
+        '/api/v1/*',
+        partial('handle_api_v1', [], {'api_version': 'v1', 'rate_limit': 1000})
+    ),
+    (
+        '/api/v2/*',
+        partial('handle_api_v2', [], {'api_version': 'v2', 'rate_limit': 5000})
+    );
+
+# Note: For this test, we'll simplify since our mock doesn't support kwargs merging
+query T
+SELECT apply_with(
+    handler,
+    args := [url_pattern_extract(pattern, '/api/v1/users')]
+)
+FROM routes_v2
+WHERE url_pattern_test(pattern, '/api/v1/users')
+LIMIT 1;
+----
+API v1 - Path: users
+
+query T
+SELECT apply_with(
+    handler,
+    args := [url_pattern_extract(pattern, '/api/v2/posts')]
+)
+FROM routes_v2
+WHERE url_pattern_test(pattern, '/api/v2/posts')
+LIMIT 1;
+----
+API v2 - Path: posts
+
+statement ok
+DROP TABLE routes_v2;
+
+# Test 3: Routing with middleware
+statement ok
+CREATE TABLE routes_with_middleware (
+    pattern VARCHAR,
+    handler VARCHAR,
+    middleware VARCHAR[]
+);
+
+statement ok
+CREATE FUNCTION auth_middleware(params STRUCT) AS
+    struct_insert(params, 'authenticated', true);
+
+statement ok
+CREATE FUNCTION log_middleware(params STRUCT) AS
+    struct_insert(params, 'logged', true);
+
+statement ok
+INSERT INTO routes_with_middleware VALUES
+    ('/users/:id', 'get_user', ['auth_middleware', 'log_middleware']);
+
+# Apply middleware chain
+query T
+WITH matched AS (
+    SELECT 
+        handler,
+        middleware,
+        url_pattern_extract(pattern, '/users/456') as params
+    FROM routes_with_middleware
+    WHERE url_pattern_test(pattern, '/users/456')
+    LIMIT 1
+),
+with_middleware AS (
+    SELECT 
+        handler,
+        list_reduce(
+            middleware,
+            (state, mw) -> apply(mw, state),
+            params
+        ) as final_params
+    FROM matched
+)
+SELECT apply(handler, final_params)
+FROM with_middleware;
+----
+User ID: 456
+
+statement ok
+DROP TABLE routes_with_middleware;
+
+# Test 4: Batch routing (multiple URLs at once)
+statement ok
+CREATE TABLE routes_batch (
+    pattern VARCHAR,
+    handler VARCHAR
+);
+
+statement ok
+INSERT INTO routes_batch VALUES
+    ('/users/:id', 'get_user'),
+    ('/posts/:tag/:date', 'get_post');
+
+statement ok
+CREATE TABLE incoming_requests (
+    request_id INTEGER,
+    url VARCHAR
+);
+
+statement ok
+INSERT INTO incoming_requests VALUES
+    (1, '/users/123'),
+    (2, '/users/456'),
+    (3, '/posts/tech/2024-01-15');
+
+query IT
+SELECT 
+    request_id,
+    apply_with(
+        (SELECT handler FROM routes_batch 
+         WHERE url_pattern_test(pattern, url) 
+         LIMIT 1),
+        args := [(SELECT url_pattern_extract(
+            (SELECT pattern FROM routes_batch 
+             WHERE url_pattern_test(pattern, url) 
+             LIMIT 1),
+            url
+        ))]
+    ) as response
+FROM incoming_requests
+ORDER BY request_id;
+----
+1	User ID: 123
+2	User ID: 456
+3	Post - Tag: tech, Date: 2024-01-15
+
+statement ok
+DROP TABLE routes_batch;
+
+statement ok
+DROP TABLE incoming_requests;
+
+# Test 5: Dynamic routing configuration
+statement ok
+CREATE TABLE route_config (
+    route_id INTEGER,
+    pattern VARCHAR,
+    handler_config JSON
+);
+
+statement ok
+INSERT INTO route_config VALUES
+    (1, '/users/:id', '{"function": "get_user", "cache_ttl": 300}'),
+    (2, '/posts/:tag/:date', '{"function": "get_post", "cache_ttl": 600}');
+
+query T
+SELECT apply_with(
+    (SELECT handler_config::JSON->>'function' FROM route_config 
+     WHERE url_pattern_test(pattern, '/users/789') 
+     LIMIT 1),
+    args := [(SELECT url_pattern_extract(
+        (SELECT pattern FROM route_config 
+         WHERE url_pattern_test(pattern, '/users/789') 
+         LIMIT 1),
+        '/users/789'
+    ))]
+);
+----
+User ID: 789
+
+statement ok
+DROP TABLE route_config;
+
+# Test 6: Create routing macro
+statement ok
+CREATE MACRO route(url VARCHAR) AS (
+    SELECT apply_with(
+        handler,
+        args := [url_pattern_extract(pattern, url)]
+    )
+    FROM (
+        VALUES
+            ('/users/:id', 'get_user'),
+            ('/posts/:tag/:date', 'get_post')
+    ) AS routes(pattern, handler)
+    WHERE url_pattern_test(pattern, url)
+    LIMIT 1
+);
+
+query T
+SELECT route('/users/999');
+----
+User ID: 999
+
+query T
+SELECT route('/posts/news/2024-12-31');
+----
+Post - Tag: news, Date: 2024-12-31
+
+statement ok
+DROP MACRO route;
+
+# Test 7: Method-based routing
+statement ok
+CREATE TABLE http_routes (
+    method VARCHAR,
+    pattern VARCHAR,
+    handler VARCHAR
+);
+
+statement ok
+INSERT INTO http_routes VALUES
+    ('GET', '/users/:id', 'get_user'),
+    ('POST', '/users/:id', 'update_user'),
+    ('DELETE', '/users/:id', 'delete_user');
+
+statement ok
+CREATE FUNCTION update_user(params STRUCT) AS
+    'Updated user ID: ' || params.id;
+
+statement ok
+CREATE FUNCTION delete_user(params STRUCT) AS
+    'Deleted user ID: ' || params.id;
+
+query T
+SELECT apply_with(
+    handler,
+    args := [url_pattern_extract(pattern, '/users/123')]
+)
+FROM http_routes
+WHERE method = 'POST' 
+  AND url_pattern_test(pattern, '/users/123')
+LIMIT 1;
+----
+Updated user ID: 123
+
+statement ok
+DROP TABLE http_routes;
+
+# Cleanup
+statement ok
+DROP FUNCTION url_pattern_test;
+
+statement ok
+DROP FUNCTION url_pattern_extract;
+
+statement ok
+DROP FUNCTION get_user;
+
+statement ok
+DROP FUNCTION get_post;
+
+statement ok
+DROP FUNCTION handle_api_v1;
+
+statement ok
+DROP FUNCTION handle_api_v2;
+
+statement ok
+DROP FUNCTION auth_middleware;
+
+statement ok
+DROP FUNCTION log_middleware;
+
+statement ok
+DROP FUNCTION update_user;
+
+statement ok
+DROP FUNCTION delete_user;

@@ -1,0 +1,392 @@
+# test/sql/functools/function_exists.test
+# Tests for function_exists() introspection helper
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Built-in scalar functions
+query T
+SELECT function_exists('upper');
+----
+true
+
+query T
+SELECT function_exists('lower');
+----
+true
+
+query T
+SELECT function_exists('concat');
+----
+true
+
+query T
+SELECT function_exists('substr');
+----
+true
+
+query T
+SELECT function_exists('length');
+----
+true
+
+# Built-in aggregate functions
+query T
+SELECT function_exists('sum');
+----
+true
+
+query T
+SELECT function_exists('count');
+----
+true
+
+query T
+SELECT function_exists('avg');
+----
+true
+
+query T
+SELECT function_exists('max');
+----
+true
+
+query T
+SELECT function_exists('min');
+----
+true
+
+# List functions
+query T
+SELECT function_exists('list_value');
+----
+true
+
+query T
+SELECT function_exists('list_transform');
+----
+true
+
+query T
+SELECT function_exists('list_filter');
+----
+true
+
+query T
+SELECT function_exists('list_reduce');
+----
+true
+
+# Date functions
+query T
+SELECT function_exists('date_part');
+----
+true
+
+query T
+SELECT function_exists('current_date');
+----
+true
+
+# Math functions
+query T
+SELECT function_exists('abs');
+----
+true
+
+query T
+SELECT function_exists('round');
+----
+true
+
+query T
+SELECT function_exists('sqrt');
+----
+true
+
+# Non-existent functions
+query T
+SELECT function_exists('nonexistent_function');
+----
+false
+
+query T
+SELECT function_exists('this_does_not_exist');
+----
+false
+
+query T
+SELECT function_exists('fake_func_123');
+----
+false
+
+# Case sensitivity (DuckDB is case-insensitive for function names)
+query T
+SELECT function_exists('UPPER');
+----
+true
+
+query T
+SELECT function_exists('Upper');
+----
+true
+
+query T
+SELECT function_exists('uPPeR');
+----
+true
+
+# User-defined functions
+statement ok
+CREATE FUNCTION my_add(a INTEGER, b INTEGER) AS a + b;
+
+query T
+SELECT function_exists('my_add');
+----
+true
+
+query T
+SELECT function_exists('MY_ADD');
+----
+true
+
+statement ok
+DROP FUNCTION my_add;
+
+query T
+SELECT function_exists('my_add');
+----
+false
+
+# User-defined macros
+statement ok
+CREATE MACRO my_upper(s) AS upper(s);
+
+query T
+SELECT function_exists('my_upper');
+----
+true
+
+statement ok
+DROP MACRO my_upper;
+
+query T
+SELECT function_exists('my_upper');
+----
+false
+
+# Use function_exists before calling apply
+statement ok
+CREATE TABLE dynamic_calls (
+    id INTEGER,
+    func_name VARCHAR,
+    arg VARCHAR
+);
+
+statement ok
+INSERT INTO dynamic_calls VALUES
+    (1, 'upper', 'hello'),
+    (2, 'nonexistent', 'test'),
+    (3, 'lower', 'WORLD');
+
+# Safe dynamic calls with validation
+query ITT
+SELECT 
+    id,
+    func_name,
+    CASE 
+        WHEN function_exists(func_name) THEN apply(func_name, arg)
+        ELSE 'Function not found: ' || func_name
+    END as result
+FROM dynamic_calls
+ORDER BY id;
+----
+1	upper	HELLO
+2	nonexistent	Function not found: nonexistent
+3	lower	world
+
+statement ok
+DROP TABLE dynamic_calls;
+
+# Validate before creating partial
+query T
+SELECT 
+    CASE 
+        WHEN function_exists('concat') THEN partial('concat', ['prefix_'])
+        ELSE NULL
+    END;
+----
+{'func': concat, 'fixed_args': [prefix_], 'fixed_kwargs': {}}
+
+# Check function exists in WHERE clause
+statement ok
+CREATE TABLE func_list (name VARCHAR);
+
+statement ok
+INSERT INTO func_list VALUES
+    ('upper'),
+    ('lower'),
+    ('nonexistent'),
+    ('reverse'),
+    ('fake_func');
+
+query T
+SELECT name
+FROM func_list
+WHERE function_exists(name)
+ORDER BY name;
+----
+lower
+reverse
+upper
+
+statement ok
+DROP TABLE func_list;
+
+# Batch validation
+query T
+SELECT list_filter(
+    ['upper', 'lower', 'fake1', 'concat', 'fake2', 'abs'],
+    f -> function_exists(f)
+);
+----
+[upper, lower, concat, abs]
+
+# Use in CTE
+query T
+WITH valid_funcs AS (
+    SELECT unnest(['upper', 'lower', 'nonexistent', 'reverse']) as func_name
+)
+SELECT list(func_name)
+FROM valid_funcs
+WHERE function_exists(func_name);
+----
+[upper, lower, reverse]
+
+# Empty string
+query T
+SELECT function_exists('');
+----
+false
+
+# Very long name
+query T
+SELECT function_exists(repeat('a', 1000));
+----
+false
+
+# Names with special characters
+query T
+SELECT function_exists('list_value');
+----
+true
+
+query T
+SELECT function_exists('date_part');
+----
+true
+
+# Operators (may or may not be recognized as functions)
+query T
+SELECT function_exists('+');
+----
+true
+
+query T
+SELECT function_exists('||');
+----
+true
+
+# Function families
+statement ok
+CREATE TABLE func_families (pattern VARCHAR);
+
+statement ok
+INSERT INTO func_families VALUES ('list_%'), ('date_%'), ('string_%');
+
+# This is more of a conceptual test - would need actual implementation
+# to check if a pattern of functions exists
+query T
+SELECT pattern
+FROM func_families
+WHERE function_exists(replace(pattern, '%', 'value'))
+    OR function_exists(replace(pattern, '%', 'part'))
+ORDER BY pattern;
+----
+date_%
+list_%
+
+statement ok
+DROP TABLE func_families;
+
+# Null handling
+statement error
+SELECT function_exists(NULL);
+----
+function name cannot be NULL
+
+# Test with table of function configs
+statement ok
+CREATE TABLE handler_config (
+    route VARCHAR,
+    handler VARCHAR,
+    is_valid BOOLEAN GENERATED ALWAYS AS (function_exists(handler))
+);
+
+statement ok
+INSERT INTO handler_config (route, handler) VALUES
+    ('/users', 'get_users'),
+    ('/posts', 'list_value'),  -- valid built-in
+    ('/admin', 'nonexistent_handler');
+
+query TT
+SELECT route, is_valid
+FROM handler_config
+ORDER BY route;
+----
+/admin	false
+/posts	true
+/users	false
+
+statement ok
+DROP TABLE handler_config;
+
+# Verify before apply_with
+statement ok
+CREATE TABLE operations (
+    id INTEGER,
+    func VARCHAR,
+    args JSON
+);
+
+statement ok
+INSERT INTO operations VALUES
+    (1, 'upper', '["hello"]'),
+    (2, 'nonexistent', '["test"]'),
+    (3, 'concat', '["a", "b"]');
+
+query IT
+SELECT 
+    id,
+    CASE
+        WHEN function_exists(func) THEN apply_with(func, args := args::JSON)
+        ELSE 'ERROR: Function ' || func || ' does not exist'
+    END as result
+FROM operations
+ORDER BY id;
+----
+1	HELLO
+2	ERROR: Function nonexistent does not exist
+3	ab
+
+statement ok
+DROP TABLE operations;
+
+# Timing - function_exists should be fast
+# (This is more of a performance note than a test)
+query T
+SELECT function_exists('upper') FROM range(10000) LIMIT 1;
+----
+true

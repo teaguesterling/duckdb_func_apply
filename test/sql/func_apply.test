@@ -1,0 +1,636 @@
+# name: test/sql/func_apply.test
+# description: test func_apply extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT func_apply('Sam');
+----
+Catalog Error: Scalar Function with name func_apply does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require func_apply
+
+# Confirm the extension works
+query I
+SELECT func_apply('Sam');
+----
+FuncApply Sam 🐥
+
+query I
+SELECT func_apply_openssl_version('Michael') ILIKE 'FuncApply Michael, my linked OpenSSL version is OpenSSL%';
+----
+true
+
+# ============================================
+# function_exists() tests
+# ============================================
+
+# Basic scalar functions
+query I
+SELECT function_exists('upper');
+----
+true
+
+query I
+SELECT function_exists('lower');
+----
+true
+
+query I
+SELECT function_exists('substr');
+----
+true
+
+query I
+SELECT function_exists('concat');
+----
+true
+
+# Aggregate functions
+query I
+SELECT function_exists('sum');
+----
+true
+
+query I
+SELECT function_exists('count');
+----
+true
+
+query I
+SELECT function_exists('avg');
+----
+true
+
+# Table functions
+query I
+SELECT function_exists('range');
+----
+true
+
+query I
+SELECT function_exists('generate_series');
+----
+true
+
+# Non-existent functions
+query I
+SELECT function_exists('not_a_real_function');
+----
+false
+
+query I
+SELECT function_exists('this_does_not_exist_12345');
+----
+false
+
+# Empty string
+query I
+SELECT function_exists('');
+----
+false
+
+# Case insensitivity
+query I
+SELECT function_exists('UPPER');
+----
+true
+
+query I
+SELECT function_exists('Upper');
+----
+true
+
+query I
+SELECT function_exists('uPpEr');
+----
+true
+
+# NULL handling
+query I
+SELECT function_exists(NULL);
+----
+NULL
+
+# Our own extension function
+query I
+SELECT function_exists('func_apply');
+----
+true
+
+query I
+SELECT function_exists('function_exists');
+----
+true
+
+# Vectorized execution
+query I
+SELECT function_exists(name) FROM (VALUES ('upper'), ('fake_func'), ('lower'), ('sum')) t(name);
+----
+true
+false
+true
+true
+
+# ============================================
+# apply() tests
+# ============================================
+
+# --- Basic string functions ---
+
+query I
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+query I
+SELECT apply('lower', 'WORLD');
+----
+world
+
+query I
+SELECT apply('trim', '  hello  ');
+----
+hello
+
+query I
+SELECT apply('ltrim', '  hello');
+----
+hello
+
+query I
+SELECT apply('rtrim', 'hello  ');
+----
+hello
+
+query I
+SELECT apply('reverse', 'hello');
+----
+olleh
+
+query I
+SELECT apply('length', 'hello');
+----
+5
+
+# --- Multi-argument string functions ---
+
+query I
+SELECT apply('substr', 'hello world', 7, 5);
+----
+world
+
+query I
+SELECT apply('substr', 'hello world', 1, 5);
+----
+hello
+
+query I
+SELECT apply('concat', 'hello', ' ', 'world');
+----
+hello world
+
+query I
+SELECT apply('replace', 'hello world', 'world', 'universe');
+----
+hello universe
+
+query I
+SELECT apply('left', 'hello world', 5);
+----
+hello
+
+query I
+SELECT apply('right', 'hello world', 5);
+----
+world
+
+query I
+SELECT apply('repeat', 'ab', 3);
+----
+ababab
+
+# --- Named parameters ---
+
+# apply() supports named parameters which are passed through to the target function
+query I
+SELECT apply('substr', 'hello world', start := 7, length := 5);
+----
+world
+
+query I
+SELECT apply('substr', 'hello world', start := 1, length := 5);
+----
+hello
+
+# Mixed positional and named
+query I
+SELECT apply('lpad', 'hi', 5, padchar := '*');
+----
+***hi
+
+# --- Numeric functions ---
+
+query I
+SELECT apply('abs', -42);
+----
+42
+
+query R
+SELECT apply('abs', -3.14);
+----
+3.14
+
+query I
+SELECT apply('floor', 3.7);
+----
+3
+
+query I
+SELECT apply('ceil', 3.2);
+----
+4
+
+query R
+SELECT apply('round', 3.14159, 2);
+----
+3.14
+
+query I
+SELECT apply('sign', -5);
+----
+-1
+
+query I
+SELECT apply('sign', 5);
+----
+1
+
+query I
+SELECT apply('sign', 0);
+----
+0
+
+# --- Math functions ---
+
+query R
+SELECT round(apply('sqrt', 16.0), 2);
+----
+4.0
+
+query R
+SELECT round(apply('ln', 2.718281828), 2);
+----
+1.0
+
+query R
+SELECT round(apply('log10', 100.0), 2);
+----
+2.0
+
+query R
+SELECT round(apply('exp', 0.0), 2);
+----
+1.0
+
+query R
+SELECT apply('power', 2.0, 3.0);
+----
+8.0
+
+# --- List functions ---
+
+# These are implemented as macros in DuckDB, apply() should handle them
+query I
+SELECT list_sum([1, 2, 3, 4, 5]);
+----
+15
+
+query I
+SELECT apply('list_sum', [1, 2, 3, 4, 5]);
+----
+15
+
+query I
+SELECT list_reverse([1, 2, 3]);
+----
+[3, 2, 1]
+
+query I
+SELECT apply('list_reverse', [1, 2, 3]);
+----
+[3, 2, 1]
+
+query I
+SELECT apply('length', [1, 2, 3]);
+----
+3
+
+# list_contains is a proper scalar function
+query I
+SELECT apply('list_contains', [1, 2, 3], 2);
+----
+true
+
+query I
+SELECT apply('list_contains', [1, 2, 3], 5);
+----
+false
+
+# --- Boolean functions ---
+
+# Note: 'not' is a SQL operator, not a function. Use logical functions instead.
+query I
+SELECT apply('isnan', 1.0);
+----
+false
+
+query I
+SELECT apply('isfinite', 1.0);
+----
+true
+
+# --- Type coercion ---
+
+# String to int coercion should work
+query I
+SELECT apply('length', 'test');
+----
+4
+
+# --- NULL handling ---
+
+query I
+SELECT apply(NULL, 'hello');
+----
+NULL
+
+query I
+SELECT apply('upper', NULL);
+----
+NULL
+
+query I
+SELECT apply('substr', NULL, 1, 2);
+----
+NULL
+
+query I
+SELECT apply('substr', 'hello', NULL, 2);
+----
+NULL
+
+# --- No arguments (functions with no params) ---
+
+query I
+SELECT apply('random') IS NOT NULL;
+----
+true
+
+# Note: current_date is a SQL keyword, not a function. Use 'now' instead.
+query I
+SELECT apply('now') IS NOT NULL;
+----
+true
+
+# --- Case insensitivity ---
+
+query I
+SELECT apply('UPPER', 'hello');
+----
+HELLO
+
+query I
+SELECT apply('Upper', 'hello');
+----
+HELLO
+
+query I
+SELECT apply('uPpEr', 'hello');
+----
+HELLO
+
+# --- Error cases ---
+
+statement error
+SELECT apply('not_a_real_function', 'test');
+----
+does not exist
+
+statement error
+SELECT apply('', 'test');
+----
+invalid function name
+
+statement error
+SELECT apply('123invalid', 'test');
+----
+invalid function name
+
+# Function name with special chars (invalid identifier)
+statement error
+SELECT apply('func;drop', 'test');
+----
+invalid function name
+
+# --- Vectorized execution ---
+
+query I
+SELECT apply('upper', s) FROM (VALUES ('hello'), ('world'), ('test')) t(s);
+----
+HELLO
+WORLD
+TEST
+
+query I
+SELECT apply('length', s) FROM (VALUES ('a'), ('ab'), ('abc'), ('abcd')) t(s);
+----
+1
+2
+3
+4
+
+query I
+SELECT apply(f, 'hello') FROM (VALUES ('upper'), ('lower'), ('reverse')) t(f);
+----
+HELLO
+hello
+olleh
+
+# Mixed nulls in vectorized
+query I
+SELECT apply('upper', s) FROM (VALUES ('hello'), (NULL), ('world')) t(s);
+----
+HELLO
+NULL
+WORLD
+
+# --- Return type verification ---
+
+# Numeric return type
+query I
+SELECT typeof(apply('length', 'hello'));
+----
+BIGINT
+
+# String return type
+query I
+SELECT typeof(apply('upper', 'hello'));
+----
+VARCHAR
+
+# Decimal return type preserved
+query I
+SELECT typeof(apply('abs', -3.14));
+----
+DECIMAL(3,2)
+
+# --- Nested apply calls ---
+
+query I
+SELECT apply('upper', apply('reverse', 'hello'));
+----
+OLLEH
+
+query I
+SELECT apply('length', apply('concat', 'hello', ' ', 'world'));
+----
+11
+
+# ============================================
+# apply_with() tests
+# ============================================
+
+# --- Basic usage with args list ---
+
+query I
+SELECT apply_with('upper', args := ['hello']);
+----
+HELLO
+
+query I
+SELECT apply_with('lower', args := ['WORLD']);
+----
+world
+
+# Note: DuckDB lists must be homogeneous types
+# For mixed-type args, use apply() directly instead
+query I
+SELECT apply_with('upper', args := ['hello world']);
+----
+HELLO WORLD
+
+query I
+SELECT apply_with('concat', args := ['hello', ' ', 'world']);
+----
+hello world
+
+# --- Different types in args list ---
+
+query I
+SELECT apply_with('abs', args := [-42]);
+----
+42
+
+query I
+SELECT apply_with('length', args := [[1, 2, 3]]);
+----
+3
+
+# --- Empty args ---
+
+query I
+SELECT apply_with('random', args := []) IS NOT NULL;
+----
+true
+
+# --- NULL args list ---
+
+query I
+SELECT apply_with('random', args := NULL) IS NOT NULL;
+----
+true
+
+# --- NULL function name ---
+
+query I
+SELECT apply_with(NULL, args := ['hello']);
+----
+NULL
+
+# --- Vectorized execution ---
+
+query I
+SELECT apply_with('upper', args := [s]) FROM (VALUES ('hello'), ('world'), ('test')) t(s);
+----
+HELLO
+WORLD
+TEST
+
+# --- Case insensitivity ---
+
+query I
+SELECT apply_with('UPPER', args := ['hello']);
+----
+HELLO
+
+# --- Error: non-existent function ---
+
+statement error
+SELECT apply_with('fake_function', args := ['test']);
+----
+does not exist
+
+# --- Error: invalid function name ---
+
+statement error
+SELECT apply_with('123bad', args := ['test']);
+----
+invalid function name
+
+# ============================================
+# Integration tests
+# ============================================
+
+# Use apply in a WHERE clause
+query I
+SELECT * FROM (VALUES ('hello'), ('WORLD'), ('Test')) t(s) WHERE apply('length', s) > 4;
+----
+hello
+WORLD
+
+# Use apply in ORDER BY
+query I
+SELECT * FROM (VALUES ('ccc'), ('a'), ('bb')) t(s) ORDER BY apply('length', s);
+----
+a
+bb
+ccc
+
+# Use apply in aggregate context
+query I
+SELECT count(*) FROM (VALUES ('a'), ('bb'), ('ccc')) t(s) WHERE apply('length', s) >= 2;
+----
+2
+
+# Use with CASE expression
+query I
+SELECT CASE WHEN function_exists(f) THEN apply(f, 'hello') ELSE 'N/A' END
+FROM (VALUES ('upper'), ('fake'), ('lower')) t(f);
+----
+HELLO
+N/A
+hello
+
+# Create table with apply result
+statement ok
+CREATE TABLE test_apply AS SELECT apply('upper', 'hello') as result;
+
+query I
+SELECT * FROM test_apply;
+----
+HELLO
+
+statement ok
+DROP TABLE test_apply;

@@ -1,0 +1,240 @@
+# test/sql/functools/apply_with.test
+# Tests for apply_with() - structured function application with args/kwargs
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Basic usage with args array
+query T
+SELECT apply_with('upper', args := ['hello']);
+----
+HELLO
+
+query T
+SELECT apply_with('concat', args := ['hello', ' ', 'world']);
+----
+hello world
+
+# With positional and keyword arguments
+query T
+SELECT apply_with('substr', 
+    args := ['hello world'],
+    kwargs := {'start': 7, 'length': 5}
+);
+----
+world
+
+query T
+SELECT apply_with('substr',
+    kwargs := {'string': 'hello world', 'start': 7, 'length': 5}
+);
+----
+world
+
+# Just kwargs, no positional args
+query T
+SELECT apply_with('concat_ws',
+    kwargs := {'separator': '-', 'values': ['a', 'b', 'c']}
+);
+----
+a-b-c
+
+# Empty args
+query T
+SELECT apply_with('pi', args := []);
+----
+3.141592653589793
+
+# NULL args (should treat as no args)
+query T
+SELECT apply_with('pi', args := NULL);
+----
+3.141592653589793
+
+# NULL kwargs (should treat as no kwargs)
+query T
+SELECT apply_with('upper', args := ['hello'], kwargs := NULL);
+----
+HELLO
+
+# Both args and kwargs NULL
+query T
+SELECT apply_with('pi', args := NULL, kwargs := NULL);
+----
+3.141592653589793
+
+# JSON args
+query T
+SELECT apply_with('concat',
+    args := '["hello", " ", "world"]'::JSON
+);
+----
+hello world
+
+# JSON kwargs
+query T
+SELECT apply_with('substr',
+    args := '["hello world"]'::JSON,
+    kwargs := '{"start": 7, "length": 5}'::JSON
+);
+----
+world
+
+# MAP kwargs
+query T
+SELECT apply_with('substr',
+    args := ['hello world'],
+    kwargs := MAP {'start': 7, 'length': 5}
+);
+----
+world
+
+# Complex nested structures
+query T
+SELECT apply_with('json_extract',
+    args := ['{"name": "Alice", "age": 30}'::JSON],
+    kwargs := {'path': '$.name'}
+);
+----
+"Alice"
+
+# Batch processing with apply_with
+statement ok
+CREATE TABLE operations (
+    id INTEGER,
+    func VARCHAR,
+    args JSON,
+    kwargs JSON
+);
+
+statement ok
+INSERT INTO operations VALUES
+    (1, 'upper', '["hello"]', NULL),
+    (2, 'substr', '["hello world"]', '{"start": 7, "length": 5}'),
+    (3, 'concat', '["a", "b", "c"]', NULL);
+
+query IT
+SELECT id, apply_with(func, args := args::JSON, kwargs := kwargs::JSON)
+FROM operations
+ORDER BY id;
+----
+1	HELLO
+2	world
+3	abc
+
+statement ok
+DROP TABLE operations;
+
+# With partial descriptor (STRUCT)
+query T
+SELECT apply_with(
+    {'func': 'concat', 'fixed_args': ['https://'], 'fixed_kwargs': {}},
+    args := ['example.com']
+);
+----
+https://example.com
+
+# Partial with fixed kwargs
+query T
+SELECT apply_with(
+    {'func': 'substr', 'fixed_args': ['hello world'], 'fixed_kwargs': {'start': 7}},
+    kwargs := {'length': 5}
+);
+----
+world
+
+# Null handling
+query T
+SELECT apply_with('upper', args := [NULL]);
+----
+NULL
+
+# Empty string
+query T
+SELECT apply_with('upper', args := ['']);
+----
+<BLANKLINE>
+
+# Special characters
+query T
+SELECT apply_with('concat', args := ['Hello', ' ', '🦆', '!']);
+----
+Hello 🦆!
+
+# Large number of args
+query T
+SELECT apply_with('concat', args := [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'
+]);
+----
+abcdefghij
+
+# Kwargs with special names
+query T
+SELECT apply_with('struct_pack',
+    kwargs := {'field_1': 'hello', 'field_2': 42, 'field_3': true}
+);
+----
+{'field_1': hello, 'field_2': 42, 'field_3': true}
+
+# Type conversions in kwargs
+query I
+SELECT apply_with('CAST',
+    args := ['42'],
+    kwargs := {'target_type': 'INTEGER'}
+);
+----
+42
+
+# Error: Invalid function name
+statement error
+SELECT apply_with('nonexistent', args := ['test']);
+----
+Function 'nonexistent' not found
+
+# Error: Invalid args type (not array or JSON)
+statement error
+SELECT apply_with('upper', args := 'not_an_array');
+----
+args must be ARRAY or JSON
+
+# Error: Invalid kwargs type (not STRUCT, MAP, or JSON)
+statement error
+SELECT apply_with('upper', args := ['hello'], kwargs := 'not_a_struct');
+----
+kwargs must be STRUCT, MAP, or JSON
+
+# Error: Malformed JSON args
+statement error
+SELECT apply_with('upper', args := '{invalid json}'::JSON);
+----
+Invalid JSON
+
+# Error: JSON args is not an array
+statement error
+SELECT apply_with('upper', args := '{"key": "value"}'::JSON);
+----
+args JSON must be an array
+
+# Error: Null function name
+statement error
+SELECT apply_with(NULL, args := ['test']);
+----
+function name cannot be NULL
+
+# Error: Invalid partial descriptor (missing fields)
+statement error
+SELECT apply_with(
+    {'func': 'upper'},  -- Missing fixed_args and fixed_kwargs
+    args := ['hello']
+);
+----
+Invalid partial descriptor
+
+# Error: Wrong argument count via kwargs
+statement error
+SELECT apply_with('abs', kwargs := {'x': 1, 'y': 2});
+----
+No function matches

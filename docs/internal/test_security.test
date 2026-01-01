@@ -1,0 +1,341 @@
+# test/sql/functools/test_security.test
+# Tests for configuration-based security
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# ===== DEFAULT BLACKLIST =====
+
+# View default blacklist
+query T
+SELECT current_setting('functools_blacklist');
+----
+install,load,system,export_database,copy
+
+# Check if functions are blacklisted
+query T
+SELECT function_is_blacklisted('system');
+----
+true
+
+query T
+SELECT function_is_blacklisted('install');
+----
+true
+
+query T
+SELECT function_is_blacklisted('upper');
+----
+false
+
+# Blacklisted functions are blocked
+statement error
+SELECT apply('system', 'echo hello');
+----
+blacklisted
+
+statement error
+SELECT apply('install', 'ext');
+----
+blacklisted
+
+statement error
+SELECT apply('load', 'ext');
+----
+blacklisted
+
+# ===== PERMISSIVE MODE (DEFAULT) =====
+
+# Default mode is permissive
+query T
+SELECT current_setting('functools_security_mode');
+----
+permissive
+
+# Non-blacklisted functions work
+query T
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+query T
+SELECT apply('concat', 'a', 'b');
+----
+ab
+
+# ===== CUSTOMIZE BLACKLIST =====
+
+# Remove system from blacklist (opt-in)
+statement ok
+SET functools_blacklist = 'install,load,export_database,copy';
+
+# Now system works
+query T
+SELECT apply('system', 'echo hello');
+----
+hello
+
+# install still blocked
+statement error
+SELECT apply('install', 'ext');
+----
+blacklisted
+
+# Add to blacklist
+statement ok
+SET functools_blacklist = 'install,load,system,custom_danger';
+
+# Custom function now blocked
+statement ok
+CREATE FUNCTION custom_danger(x VARCHAR) AS x;
+
+statement error
+SELECT apply('custom_danger', 'test');
+----
+blacklisted
+
+statement ok
+DROP FUNCTION custom_danger;
+
+# Reset blacklist
+statement ok
+SET functools_blacklist = 'install,load,system,export_database,copy';
+
+# ===== WHITELIST MODE =====
+
+# Enable whitelist mode
+statement ok
+SET functools_security_mode = 'whitelist';
+
+# Set whitelist
+statement ok
+SET functools_whitelist = 'upper,lower,concat';
+
+# Whitelisted functions work
+query T
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+query T
+SELECT apply('concat', 'a', 'b');
+----
+ab
+
+# Non-whitelisted blocked
+statement error
+SELECT apply('substr', 'hello', 1, 2);
+----
+not in whitelist
+
+# Check if whitelisted
+query T
+SELECT function_is_whitelisted('upper');
+----
+true
+
+query T
+SELECT function_is_whitelisted('substr');
+----
+false
+
+# Blacklist still enforced even in whitelist
+statement ok
+SET functools_whitelist = 'upper,system';
+
+statement error
+SELECT apply('system', 'echo hi');
+----
+blacklisted
+
+# Reset
+statement ok
+SET functools_security_mode = 'permissive';
+statement ok
+SET functools_whitelist = '';
+
+# ===== CUSTOM VALIDATOR =====
+
+# Create validator
+statement ok
+CREATE FUNCTION my_validator(func VARCHAR, args ANY[]) AS (
+    CASE
+        WHEN func = 'upper' THEN true
+        WHEN func = 'lower' THEN length(args[1]::VARCHAR) < 10
+        ELSE false
+    END
+)::BOOLEAN;
+
+# Set validator
+statement ok
+SET functools_validator = 'my_validator';
+
+# Pass validation
+query T
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+query T
+SELECT apply('lower', 'SHORT');
+----
+short
+
+# Fail validation
+statement error
+SELECT apply('lower', 'this is very long');
+----
+failed custom validation
+
+statement error
+SELECT apply('concat', 'a', 'b');
+----
+failed custom validation
+
+# Clear validator
+statement ok
+SET functools_validator = '';
+
+# Now works
+query T
+SELECT apply('concat', 'a', 'b');
+----
+ab
+
+statement ok
+DROP FUNCTION my_validator;
+
+# ===== STRICT MODE =====
+
+statement ok
+SET functools_security_mode = 'strict';
+statement ok
+SET functools_whitelist = 'upper,lower';
+statement ok
+CREATE FUNCTION strict_val(f VARCHAR, a ANY[]) AS true::BOOLEAN;
+statement ok
+SET functools_validator = 'strict_val';
+
+# Pass all checks
+query T
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+# Fail whitelist
+statement error
+SELECT apply('concat', 'a', 'b');
+----
+not in whitelist
+
+# Reset
+statement ok
+SET functools_security_mode = 'permissive';
+statement ok
+SET functools_validator = '';
+statement ok
+SET functools_whitelist = '';
+statement ok
+DROP FUNCTION strict_val;
+
+# ===== SECURITY INFO =====
+
+query T
+SELECT function_security_info('system')->>'blacklisted';
+----
+true
+
+query T
+SELECT function_security_info('upper')->>'allowed';
+----
+true
+
+# ===== EMPTY BLACKLIST (DANGEROUS!) =====
+
+statement ok
+SET functools_blacklist = '';
+
+# Now dangerous functions work
+query T
+SELECT apply('system', 'echo "testing"');
+----
+testing
+
+# Reset to safe default
+statement ok
+SET functools_blacklist = 'install,load,system,export_database,copy';
+
+# ===== CASE INSENSITIVE =====
+
+query T
+SELECT function_is_blacklisted('SYSTEM');
+----
+true
+
+query T
+SELECT function_is_blacklisted('System');
+----
+true
+
+# ===== AUDIT LOGGING =====
+
+statement ok
+SET functools_log_calls = true;
+
+query T
+SELECT apply('upper', 'test');
+----
+TEST
+
+# Check log exists
+query T
+SELECT count(*) >= 1 FROM functools_audit_log;
+----
+true
+
+# Check logged function
+query T
+SELECT function_name FROM functools_audit_log
+WHERE function_name = 'upper'
+ORDER BY timestamp DESC
+LIMIT 1;
+----
+upper
+
+statement ok
+SET functools_log_calls = false;
+
+# ===== PARSE SETTINGS =====
+
+# Parse comma-delimited
+statement ok
+SET functools_whitelist = 'upper, lower , concat,substr';
+
+query T
+SELECT function_is_whitelisted('upper');
+----
+true
+
+query T
+SELECT function_is_whitelisted('lower');
+----
+true
+
+# Reset
+statement ok
+SET functools_whitelist = '';
+
+# ===== LIST ALL =====
+
+# List blacklisted functions
+query T
+SELECT unnest(string_split(current_setting('functools_blacklist'), ','))
+ORDER BY 1;
+----
+copy
+export_database
+install
+load
+system

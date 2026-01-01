@@ -1,0 +1,355 @@
+# test/sql/functools/patterns.test
+# Tests for patterns combining functools with DuckDB lambdas and list operations
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Pattern: Map using list_transform + lambda + apply
+query T
+SELECT list_transform(
+    ['hello', 'world', 'duckdb'],
+    x -> apply('upper', x)
+);
+----
+[HELLO, WORLD, DUCKDB]
+
+query T
+SELECT list_transform(
+    ['  hello  ', '  world  ', '  test  '],
+    x -> apply('trim', x)
+);
+----
+[hello, world, test]
+
+# Pattern: Reduce using list_reduce + lambda + apply
+query T
+SELECT list_reduce(
+    ['a', 'b', 'c', 'd'],
+    (x, y) -> apply('concat', x, y)
+);
+----
+abcd
+
+query T
+SELECT list_reduce(
+    ['hello', ' ', 'world'],
+    (acc, val) -> apply('concat', acc, val),
+    ''
+);
+----
+hello world
+
+# Pattern: Filter using list_filter + lambda + apply
+statement ok
+CREATE FUNCTION is_long(s VARCHAR) AS length(s) > 5;
+
+query T
+SELECT list_filter(
+    ['hi', 'hello', 'world', 'duckdb'],
+    x -> apply('is_long', x)::BOOLEAN
+);
+----
+[hello, duckdb]
+
+# Pattern: Map with apply_with and kwargs
+query T
+SELECT list_transform(
+    ['hello world', 'duck db', 'test string'],
+    x -> apply_with('substr', args := [x], kwargs := {'start': 1, 'length': 5})
+);
+----
+[hello, duck , test ]
+
+# Pattern: Nested transformations
+query T
+SELECT list_transform(
+    list_transform(
+        ['hello', 'world'],
+        x -> apply('concat', x, '_suffix')
+    ),
+    x -> apply('upper', x)
+);
+----
+[HELLO_SUFFIX, WORLD_SUFFIX]
+
+# Pattern: List comprehension with apply
+query T
+SELECT [apply('upper', x) FOR x IN ['hello', 'world', 'test']];
+----
+[HELLO, WORLD, TEST]
+
+query T
+SELECT [apply('abs', x) FOR x IN [-1, -2, 3, -4, 5]];
+----
+[1, 2, 3, 4, 5]
+
+# Pattern: List comprehension with filter and apply
+query T
+SELECT [apply('upper', x) FOR x IN ['hello', 'hi', 'world', 'ok'] IF length(x) > 2];
+----
+[HELLO, WORLD]
+
+# Pattern: Dynamic function selection with apply
+statement ok
+CREATE TABLE transforms (
+    id INTEGER,
+    func_name VARCHAR,
+    input VARCHAR
+);
+
+statement ok
+INSERT INTO transforms VALUES
+    (1, 'upper', 'hello'),
+    (2, 'lower', 'WORLD'),
+    (3, 'reverse', 'test');
+
+query IT
+SELECT id, apply(func_name, input)
+FROM transforms
+ORDER BY id;
+----
+1	HELLO
+2	world
+3	tset
+
+statement ok
+DROP TABLE transforms;
+
+# Pattern: Partial application in pipelines
+statement ok
+CREATE TABLE pipeline_steps (
+    step INTEGER,
+    transform STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO pipeline_steps VALUES
+    (1, partial('trim', [])),
+    (2, partial('upper', [])),
+    (3, partial('concat', ['PREFIX_']));
+
+query T
+SELECT list_reduce(
+    (SELECT list(transform ORDER BY step) FROM pipeline_steps),
+    (value, partial_func) -> apply_with(partial_func, args := [value]),
+    '  hello  '
+);
+----
+PREFIX_HELLO
+
+statement ok
+DROP TABLE pipeline_steps;
+
+# Pattern: Map with partial application
+query T
+SELECT list_transform(
+    ['example.com', 'test.org', 'demo.net'],
+    url -> apply_with(
+        partial('concat', ['https://']),
+        args := [url]
+    )
+);
+----
+[https://example.com, https://test.org, https://demo.net]
+
+# Pattern: Aggregate using list_aggregate
+query I
+SELECT apply('list_aggregate', [1, 2, 3, 4, 5], 'sum');
+----
+15
+
+query I
+SELECT apply('list_aggregate', [10, 20, 5, 15], 'max');
+----
+20
+
+# Pattern: Combining list operations
+query T
+SELECT list_transform(
+    list_filter(
+        ['hello', 'hi', 'world', 'ok', 'duckdb'],
+        x -> length(x) > 2
+    ),
+    x -> apply('upper', x)
+);
+----
+[HELLO, WORLD, DUCKDB]
+
+# Pattern: Data-driven transformations
+statement ok
+CREATE TABLE data_pipeline (
+    source_id INTEGER,
+    data VARCHAR,
+    transforms JSON
+);
+
+statement ok
+INSERT INTO data_pipeline VALUES
+    (1, '  hello  ', '["trim", "upper"]'::JSON),
+    (2, 'world', '["upper", "reverse"]'::JSON);
+
+query IT
+SELECT 
+    source_id,
+    list_reduce(
+        transforms::VARCHAR[],
+        (value, func) -> apply(func, value),
+        data
+    ) as result
+FROM data_pipeline
+ORDER BY source_id;
+----
+1	HELLO
+2	DLROW
+
+statement ok
+DROP TABLE data_pipeline;
+
+# Pattern: Middleware composition
+statement ok
+CREATE TABLE middleware_chain (
+    order_num INTEGER,
+    middleware STRUCT(func VARCHAR, fixed_args ANY[], fixed_kwargs STRUCT)
+);
+
+statement ok
+INSERT INTO middleware_chain VALUES
+    (1, partial('concat', ['[auth] '])),
+    (2, partial('concat', ['[validate] '])),
+    (3, partial('concat', ['[process] ']));
+
+query T
+SELECT list_reduce(
+    (SELECT list(middleware ORDER BY order_num) FROM middleware_chain),
+    (request, mw) -> apply_with(mw, args := [request]),
+    'USER_REQUEST'
+);
+----
+[process] [validate] [auth] USER_REQUEST
+
+statement ok
+DROP TABLE middleware_chain;
+
+# Pattern: Conditional application
+statement ok
+CREATE TABLE conditional_ops (
+    id INTEGER,
+    value INTEGER,
+    operation VARCHAR
+);
+
+statement ok
+INSERT INTO conditional_ops VALUES
+    (1, -5, 'abs'),
+    (2, 10, 'abs'),
+    (3, -3, 'abs');
+
+query II
+SELECT 
+    id,
+    CASE 
+        WHEN value < 0 THEN apply(operation, value)
+        ELSE value
+    END as result
+FROM conditional_ops
+ORDER BY id;
+----
+1	5
+2	10
+3	3
+
+statement ok
+DROP TABLE conditional_ops;
+
+# Pattern: Function composition using nested apply
+query T
+SELECT apply('upper',
+    apply('reverse',
+        apply('trim', '  hello  ')
+    )
+);
+----
+OLLEH
+
+# Pattern: Map-reduce with apply
+query I
+SELECT list_reduce(
+    list_transform(
+        [1, 2, 3, 4, 5],
+        x -> apply('*', x, 2)
+    ),
+    (x, y) -> apply('+', x, y)
+);
+----
+30
+
+# Pattern: Batch operations with list_transform and apply_with
+statement ok
+CREATE TABLE batch_config (
+    item VARCHAR,
+    func VARCHAR,
+    kwargs JSON
+);
+
+statement ok
+INSERT INTO batch_config VALUES
+    ('hello world', 'substr', '{"start": 7, "length": 5}'),
+    ('duckdb test', 'substr', '{"start": 1, "length": 6}');
+
+query TT
+SELECT 
+    item,
+    apply_with(func, args := [item], kwargs := kwargs::JSON)
+FROM batch_config;
+----
+hello world	world
+duckdb test	duckdb
+
+statement ok
+DROP TABLE batch_config;
+
+# Pattern: Nested list operations
+query T
+SELECT list_transform(
+    [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+    inner_list -> list_transform(
+        inner_list,
+        x -> apply('*', x, 10)
+    )
+);
+----
+[[10, 20, 30], [40, 50, 60], [70, 80, 90]]
+
+# Pattern: Variadic function with apply
+query T
+SELECT apply('concat_ws', ',', 'a', 'b', 'c', 'd', 'e');
+----
+a,b,c,d,e
+
+query T
+SELECT list_transform(
+    [[1,2,3], [4,5], [6,7,8,9]],
+    lst -> apply('list_aggregate', lst, 'sum')
+);
+----
+[6, 9, 30]
+
+# Pattern: Flatten and transform
+query T
+SELECT list_transform(
+    flatten([[1, 2], [3, 4], [5, 6]]),
+    x -> apply('*', x, 10)
+);
+----
+[10, 20, 30, 40, 50, 60]
+
+# Pattern: Zip and apply
+query T
+SELECT list_transform(
+    list_zip(['a', 'b', 'c'], [1, 2, 3]),
+    pair -> apply('concat', pair.a, '_', pair.b::VARCHAR)
+);
+----
+[a_1, b_2, c_3]

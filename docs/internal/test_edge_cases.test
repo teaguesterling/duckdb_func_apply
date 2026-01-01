@@ -1,0 +1,474 @@
+# test/sql/functools/edge_cases.test
+# Tests for edge cases and error handling
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# ===== NULL HANDLING =====
+
+# Null function name in apply
+statement error
+SELECT apply(NULL, 'arg');
+----
+function name cannot be NULL
+
+# Null function name in apply_with
+statement error
+SELECT apply_with(NULL, args := ['arg']);
+----
+function name cannot be NULL
+
+# Null function name in partial
+statement error
+SELECT partial(NULL, ['arg']);
+----
+function name cannot be NULL
+
+# Null arguments are passed through
+query T
+SELECT apply('concat', 'hello', NULL, 'world');
+----
+NULL
+
+query T
+SELECT apply_with('concat', args := ['hello', NULL, 'world']);
+----
+NULL
+
+# Null in args array
+query T
+SELECT apply_with('upper', args := [NULL]);
+----
+NULL
+
+# Null args parameter (treated as empty array)
+query R
+SELECT apply_with('pi', args := NULL);
+----
+3.141592653589793
+
+# Null kwargs parameter (treated as empty struct)
+query T
+SELECT apply_with('upper', args := ['hello'], kwargs := NULL);
+----
+HELLO
+
+# ===== EMPTY INPUTS =====
+
+# Empty string argument
+query T
+SELECT apply('upper', '');
+----
+<BLANKLINE>
+
+# Empty array
+query T
+SELECT apply_with('list_value', args := []);
+----
+[]
+
+# Empty kwargs
+query T
+SELECT apply_with('upper', args := ['hello'], kwargs := {});
+----
+HELLO
+
+# Function with no arguments
+query R
+SELECT apply('pi');
+----
+3.141592653589793
+
+query R
+SELECT apply_with('pi', args := []);
+----
+3.141592653589793
+
+# ===== TYPE MISMATCHES =====
+
+# Wrong argument type
+statement error
+SELECT apply('abs', 'not_a_number');
+----
+Conversion Error
+
+# Wrong number of arguments (too few)
+statement error
+SELECT apply('substr', 'hello');
+----
+No function matches
+
+# Wrong number of arguments (too many)
+statement error
+SELECT apply('upper', 'hello', 'extra', 'args');
+----
+No function matches
+
+# Invalid kwargs parameter name
+statement error
+SELECT apply_with('upper', kwargs := {'invalid_param': 'value'});
+----
+No function matches
+
+# ===== SPECIAL CHARACTERS =====
+
+# Unicode
+query T
+SELECT apply('upper', '🦆 duckdb');
+----
+🦆 DUCKDB
+
+query T
+SELECT apply('concat', 'Hello ', '世界', '!');
+----
+Hello 世界!
+
+# Newlines
+query T
+SELECT apply('concat', 'line1', chr(10), 'line2');
+----
+line1
+line2
+
+# Tabs
+query T
+SELECT apply('concat', 'col1', chr(9), 'col2');
+----
+col1	col2
+
+# Quotes in strings
+query T
+SELECT apply('concat', 'He said "hello"', ' to me');
+----
+He said "hello" to me
+
+# Backslashes
+query T
+SELECT apply('concat', 'path\to\file', '.txt');
+----
+path\to\file.txt
+
+# ===== LARGE INPUTS =====
+
+# Long string
+query I
+SELECT length(apply('upper', repeat('a', 10000)));
+----
+10000
+
+# Many arguments
+query I
+SELECT length(apply('concat', 
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+    'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't'
+));
+----
+20
+
+# Large array
+query I
+SELECT list_length(apply_with('list_value', args := range(1000)));
+----
+1000
+
+# ===== FUNCTION NAME VARIATIONS =====
+
+# Case sensitivity
+query T
+SELECT apply('UPPER', 'hello');
+----
+HELLO
+
+query T
+SELECT apply('Upper', 'hello');
+----
+HELLO
+
+query T
+SELECT apply('uPPeR', 'hello');
+----
+HELLO
+
+# Function with underscores
+query I
+SELECT apply('date_part', 'year', DATE '2024-01-15');
+----
+2024
+
+# Operators as function names
+query I
+SELECT apply('+', 10, 32);
+----
+42
+
+query I
+SELECT apply('*', 6, 7);
+----
+42
+
+query I
+SELECT apply('-', 100, 58);
+----
+42
+
+# ===== OVERLOADED FUNCTIONS =====
+
+# Overloaded function (different arg count)
+query T
+SELECT apply('concat', 'a', 'b');
+----
+ab
+
+query T
+SELECT apply('concat', 'a', 'b', 'c');
+----
+abc
+
+query T
+SELECT apply('concat', 'a', 'b', 'c', 'd', 'e');
+----
+abcde
+
+# Overloaded function (different arg types)
+query I
+SELECT apply('abs', -42);
+----
+42
+
+query R
+SELECT apply('abs', -3.14);
+----
+3.14
+
+# ===== RECURSIVE / NESTED CALLS =====
+
+# Deeply nested apply calls
+query I
+SELECT apply('+',
+    apply('+',
+        apply('+',
+            apply('+', 1, 2),
+            3
+        ),
+        4
+    ),
+    5
+);
+----
+15
+
+# Nested apply_with
+query T
+SELECT apply_with('concat',
+    args := [
+        apply_with('upper', args := ['hello']),
+        ' ',
+        apply_with('upper', args := ['world'])
+    ]
+);
+----
+HELLO WORLD
+
+# ===== INVALID JSON =====
+
+# Malformed JSON in args
+statement error
+SELECT apply_with('upper', args := '{invalid}'::JSON);
+----
+Invalid JSON
+
+# JSON object instead of array for args
+statement error
+SELECT apply_with('upper', args := '{"key": "value"}'::JSON);
+----
+args JSON must be an array
+
+# JSON array instead of object for kwargs
+statement error
+SELECT apply_with('upper', args := ['hello'], kwargs := '["not", "object"]'::JSON);
+----
+kwargs JSON must be an object
+
+# ===== PARTIAL EDGE CASES =====
+
+# Partial with all args fixed
+query T
+SELECT apply_with(
+    partial('concat', ['hello', ' ', 'world']),
+    args := []
+);
+----
+hello world
+
+# Partial with no args fixed
+query T
+SELECT apply_with(
+    partial('concat', []),
+    args := ['hello', ' ', 'world']
+);
+----
+hello world
+
+# Invalid partial descriptor (missing fields)
+statement error
+SELECT apply_with({'func': 'upper'}, args := ['hello']);
+----
+Invalid partial descriptor
+
+# Invalid partial descriptor (wrong field types)
+statement error
+SELECT apply_with(
+    {'func': 123, 'fixed_args': [], 'fixed_kwargs': {}},
+    args := ['hello']
+);
+----
+Invalid partial descriptor
+
+# ===== CONCURRENT / BATCH EDGE CASES =====
+
+# Empty table
+statement ok
+CREATE TABLE empty_test (id INTEGER, val VARCHAR);
+
+query I
+SELECT COUNT(*)
+FROM (
+    SELECT apply('upper', val)
+    FROM empty_test
+);
+----
+0
+
+statement ok
+DROP TABLE empty_test;
+
+# Large batch
+statement ok
+CREATE TABLE large_batch (id INTEGER);
+
+statement ok
+INSERT INTO large_batch SELECT range FROM range(1000);
+
+query I
+SELECT COUNT(DISTINCT apply('abs', id))
+FROM large_batch;
+----
+1000
+
+statement ok
+DROP TABLE large_batch;
+
+# ===== MIXED NULL AND NON-NULL =====
+
+statement ok
+CREATE TABLE mixed_nulls (id INTEGER, val VARCHAR);
+
+statement ok
+INSERT INTO mixed_nulls VALUES
+    (1, 'hello'),
+    (2, NULL),
+    (3, 'world'),
+    (4, NULL),
+    (5, 'test');
+
+query IT
+SELECT id, apply('upper', val)
+FROM mixed_nulls
+ORDER BY id;
+----
+1	HELLO
+2	NULL
+3	WORLD
+4	NULL
+5	TEST
+
+statement ok
+DROP TABLE mixed_nulls;
+
+# ===== FUNCTION_EXISTS EDGE CASES =====
+
+# Valid function
+query T
+SELECT function_exists('upper');
+----
+true
+
+# Invalid function
+query T
+SELECT function_exists('nonexistent_func');
+----
+false
+
+# Case sensitivity in function_exists
+query T
+SELECT function_exists('UPPER');
+----
+true
+
+# Null function name
+statement error
+SELECT function_exists(NULL);
+----
+function name cannot be NULL
+
+# Empty string
+query T
+SELECT function_exists('');
+----
+false
+
+# Built-in vs UDF
+statement ok
+CREATE FUNCTION my_custom_func(x INTEGER) AS x * 2;
+
+query T
+SELECT function_exists('my_custom_func');
+----
+true
+
+statement ok
+DROP FUNCTION my_custom_func;
+
+query T
+SELECT function_exists('my_custom_func');
+----
+false
+
+# ===== TRANSACTION ISOLATION =====
+
+# Function still works after rollback
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE FUNCTION temp_func(x INTEGER) AS x * 2;
+
+query I
+SELECT apply('temp_func', 21);
+----
+42
+
+statement ok
+ROLLBACK;
+
+# Function should be gone
+statement error
+SELECT apply('temp_func', 21);
+----
+Function 'temp_func' not found
+
+# ===== MEMORY / RESOURCE LIMITS =====
+
+# Very long function name
+statement error
+SELECT apply(repeat('a', 10000), 'arg');
+----
+Function not found
+
+# Very long argument
+query I
+SELECT length(apply('length', repeat('x', 100000)));
+----
+100000

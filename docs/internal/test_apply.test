@@ -1,0 +1,171 @@
+# test/sql/functools/apply.test
+# Tests for apply() - variadic direct function application
+
+require functools
+
+statement ok
+LOAD 'functools';
+
+# Basic single argument
+query T
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+# Multiple arguments
+query T
+SELECT apply('concat', 'hello', ' ', 'world');
+----
+hello world
+
+query T
+SELECT apply('substr', 'hello world', 7, 5);
+----
+world
+
+# Numeric functions
+query I
+SELECT apply('abs', -42);
+----
+42
+
+query I
+SELECT apply('+', 10, 32);
+----
+42
+
+query R
+SELECT apply('round', 3.14159, 2);
+----
+3.14
+
+# String functions
+query T
+SELECT apply('replace', 'hello world', 'world', 'duckdb');
+----
+hello duckdb
+
+query T
+SELECT apply('trim', '  hello  ');
+----
+hello
+
+query I
+SELECT apply('length', 'hello');
+----
+5
+
+# List functions
+query T
+SELECT apply('list_value', 1, 2, 3, 4, 5);
+----
+[1, 2, 3, 4, 5]
+
+query I
+SELECT apply('len', [1, 2, 3, 4, 5]);
+----
+5
+
+# Date functions
+query I
+SELECT apply('date_part', 'year', DATE '2024-01-15');
+----
+2024
+
+# Null handling
+query T
+SELECT apply('upper', NULL);
+----
+NULL
+
+query T
+SELECT apply('concat', 'hello', NULL, 'world');
+----
+NULL
+
+# Zero arguments (functions that take no args)
+query T
+SELECT apply('current_date');
+----
+<DATE>
+
+# Variadic functions
+query T
+SELECT apply('concat_ws', '-', 'a', 'b', 'c', 'd');
+----
+a-b-c-d
+
+query T
+SELECT apply('format', 'Hello {}, you are {} years old', 'Alice', 30);
+----
+Hello Alice, you are 30 years old
+
+# Type coercion
+query I
+SELECT apply('CAST', '42', 'INTEGER');
+----
+42
+
+# Case insensitive function names
+query T
+SELECT apply('UPPER', 'hello');
+----
+HELLO
+
+query T
+SELECT apply('Upper', 'hello');
+----
+HELLO
+
+# Batch processing (vectorized)
+statement ok
+CREATE TABLE test_data (id INTEGER, text VARCHAR);
+
+statement ok
+INSERT INTO test_data VALUES 
+    (1, 'hello'),
+    (2, 'world'),
+    (3, 'duckdb');
+
+query IT
+SELECT id, apply('upper', text)
+FROM test_data
+ORDER BY id;
+----
+1	HELLO
+2	WORLD
+3	DUCKDB
+
+# Clean up
+statement ok
+DROP TABLE test_data;
+
+# Error: Function not found
+statement error
+SELECT apply('nonexistent_function', 'arg');
+----
+Function 'nonexistent_function' not found
+
+# Error: Wrong number of arguments
+statement error
+SELECT apply('substr', 'hello');
+----
+No function matches
+
+# Error: Wrong argument types
+statement error
+SELECT apply('abs', 'not_a_number');
+----
+Conversion Error
+
+# Error: No function name provided
+statement error
+SELECT apply();
+----
+Binder Error
+
+# Error: Null function name
+statement error
+SELECT apply(NULL, 'arg');
+----
+function name cannot be NULL
