@@ -110,8 +110,7 @@ static const vector<string> DEFAULT_BLACKLIST = {
     // File operations that could be dangerous
     "export_database", "import_database",
     // Secret management
-    "create_secret", "drop_secret"
-};
+    "create_secret", "drop_secret"};
 
 // Security configuration per session
 struct FuncApplySecurityConfig {
@@ -147,7 +146,7 @@ struct FuncApplySecurityConfig {
 // Global map for per-session security configuration
 // Key: raw pointer to ClientContext (lifetime managed by DuckDB)
 static mutex security_config_mutex;
-static unordered_map<ClientContext*, unique_ptr<FuncApplySecurityConfig>> security_configs;
+static unordered_map<ClientContext *, unique_ptr<FuncApplySecurityConfig>> security_configs;
 
 // Get or create security config for a session
 static FuncApplySecurityConfig &GetSecurityConfig(ClientContext &context) {
@@ -169,8 +168,8 @@ static void CleanupSecurityConfig(ClientContext &context) {
 }
 
 // Forward declaration for validator
-static Value ExecuteFunctionInternal(ClientContext &context, const string &func_name,
-                                     const vector<Value> &args, bool skip_security_check);
+static Value ExecuteFunctionInternal(ClientContext &context, const string &func_name, const vector<Value> &args,
+                                     bool skip_security_check);
 
 // Call the validator function to check if a call is allowed
 // Builds a parameters struct with the following structure:
@@ -187,9 +186,8 @@ static Value ExecuteFunctionInternal(ClientContext &context, const string &func_
 //     arg_values: STRUCT       -- {'start': 7, 'length': 5, ...}
 //   }
 // }
-static bool CallValidator(ClientContext &context, const string &validator_name,
-                          const string &func_name, const vector<Value> &positional_args,
-                          const case_insensitive_map_t<Value> &named_args) {
+static bool CallValidator(ClientContext &context, const string &validator_name, const string &func_name,
+                          const vector<Value> &positional_args, const case_insensitive_map_t<Value> &named_args) {
 	// Build positional struct
 	vector<Value> pos_indexes;
 	vector<Value> pos_types;
@@ -212,7 +210,8 @@ static bool CallValidator(ClientContext &context, const string &validator_name,
 		positional_struct = Value::STRUCT(std::move(pos_struct_fields));
 	} else {
 		child_list_t<Value> pos_struct_fields;
-		pos_struct_fields.push_back(make_pair("arg_indexes", Value::LIST(LogicalType::VARCHAR, std::move(pos_indexes))));
+		pos_struct_fields.push_back(
+		    make_pair("arg_indexes", Value::LIST(LogicalType::VARCHAR, std::move(pos_indexes))));
 		pos_struct_fields.push_back(make_pair("arg_types", Value::LIST(LogicalType::VARCHAR, std::move(pos_types))));
 		pos_struct_fields.push_back(make_pair("arg_values", Value::STRUCT(std::move(pos_values))));
 		positional_struct = Value::STRUCT(std::move(pos_struct_fields));
@@ -239,8 +238,10 @@ static bool CallValidator(ClientContext &context, const string &validator_name,
 		named_struct = Value::STRUCT(std::move(named_struct_fields));
 	} else {
 		child_list_t<Value> named_struct_fields;
-		named_struct_fields.push_back(make_pair("arg_names", Value::LIST(LogicalType::VARCHAR, std::move(named_names))));
-		named_struct_fields.push_back(make_pair("arg_types", Value::LIST(LogicalType::VARCHAR, std::move(named_types))));
+		named_struct_fields.push_back(
+		    make_pair("arg_names", Value::LIST(LogicalType::VARCHAR, std::move(named_names))));
+		named_struct_fields.push_back(
+		    make_pair("arg_types", Value::LIST(LogicalType::VARCHAR, std::move(named_types))));
 		named_struct_fields.push_back(make_pair("arg_values", Value::STRUCT(std::move(named_values))));
 		named_struct = Value::STRUCT(std::move(named_struct_fields));
 	}
@@ -270,8 +271,7 @@ static bool CallValidator(ClientContext &context, const string &validator_name,
 // Validate a function call against the security policy
 // Returns true if allowed, false if blocked (caller handles on_block behavior)
 // Throws if on_block = "error" and the call is blocked
-static bool ValidateFunctionCall(ClientContext &context, const string &func_name,
-                                 const vector<Value> &positional_args,
+static bool ValidateFunctionCall(ClientContext &context, const string &func_name, const vector<Value> &positional_args,
                                  const case_insensitive_map_t<Value> &named_args = {}) {
 	auto &config = GetSecurityConfig(context);
 
@@ -299,9 +299,8 @@ static bool ValidateFunctionCall(ClientContext &context, const string &func_name
 
 	if (!allowed) {
 		if (config.on_block == "error") {
-			throw InvalidInputException(
-			    "Function '%s' is blocked by func_apply security policy (mode: %s)",
-			    func_name, config.mode);
+			throw InvalidInputException("Function '%s' is blocked by func_apply security policy (mode: %s)", func_name,
+			                            config.mode);
 		}
 		return false;
 	}
@@ -326,11 +325,10 @@ static Value GetBlockedValue(ClientContext &context) {
 //===--------------------------------------------------------------------===//
 
 // Helper to check if a function exists in a specific catalog
-static bool CheckFunctionExistsInCatalog(ClientContext &context, Catalog &catalog,
-                                         const string &func_name, const vector<CatalogType> &types) {
+static bool CheckFunctionExistsInCatalog(ClientContext &context, Catalog &catalog, const string &func_name,
+                                         const vector<CatalogType> &types) {
 	for (auto type : types) {
-		auto entry = catalog.GetEntry(context, type, DEFAULT_SCHEMA, func_name,
-		                              OnEntryNotFound::RETURN_NULL);
+		auto entry = catalog.GetEntry(context, type, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
 		if (entry) {
 			return true;
 		}
@@ -344,12 +342,9 @@ static bool CheckFunctionExists(ClientContext &context, const string &func_name)
 	}
 
 	// Check each function type in order
-	static const vector<CatalogType> function_types = {
-	    CatalogType::SCALAR_FUNCTION_ENTRY,
-	    CatalogType::AGGREGATE_FUNCTION_ENTRY,
-	    CatalogType::TABLE_FUNCTION_ENTRY,
-	    CatalogType::MACRO_ENTRY
-	};
+	static const vector<CatalogType> function_types = {CatalogType::SCALAR_FUNCTION_ENTRY,
+	                                                   CatalogType::AGGREGATE_FUNCTION_ENTRY,
+	                                                   CatalogType::TABLE_FUNCTION_ENTRY, CatalogType::MACRO_ENTRY};
 
 	// First check system catalog (built-in functions)
 	auto &system_catalog = Catalog::GetSystemCatalog(context);
@@ -376,12 +371,9 @@ inline void FunctionExistsScalarFun(DataChunk &args, ExpressionState &state, Vec
 	auto &context = state.GetContext();
 	auto &name_vector = args.data[0];
 
-	UnaryExecutor::Execute<string_t, bool>(
-	    name_vector, result, args.size(),
-	    [&](string_t name) {
-		    return CheckFunctionExists(context, name.GetString());
-	    }
-	);
+	UnaryExecutor::Execute<string_t, bool>(name_vector, result, args.size(), [&](string_t name) {
+		return CheckFunctionExists(context, name.GetString());
+	});
 }
 
 //===--------------------------------------------------------------------===//
@@ -514,8 +506,8 @@ static bool FunctionExistsOfType(ClientContext &context, const string &func_name
 	if (!default_db_name.empty()) {
 		auto catalog_entry = Catalog::GetCatalogEntry(context, default_db_name);
 		if (catalog_entry) {
-			auto user_entry = catalog_entry->GetEntry(context, type, DEFAULT_SCHEMA, func_name,
-			                                          OnEntryNotFound::RETURN_NULL);
+			auto user_entry =
+			    catalog_entry->GetEntry(context, type, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
 			if (user_entry && user_entry->type == type) {
 				return true;
 			}
@@ -534,10 +526,7 @@ static bool FunctionExistsOfType(ClientContext &context, const string &func_name
 static CatalogType GetCallableFunctionType(ClientContext &context, const string &func_name) {
 	// Order matters: prefer scalar functions, then macros
 	// We exclude table functions - those must be called via apply_table
-	static const vector<CatalogType> callable_types = {
-	    CatalogType::SCALAR_FUNCTION_ENTRY,
-	    CatalogType::MACRO_ENTRY
-	};
+	static const vector<CatalogType> callable_types = {CatalogType::SCALAR_FUNCTION_ENTRY, CatalogType::MACRO_ENTRY};
 
 	for (auto type : callable_types) {
 		if (FunctionExistsOfType(context, func_name, type)) {
@@ -561,8 +550,8 @@ static bool TableFunctionExists(ClientContext &context, const string &func_name)
 // name could be dynamic (coming from a column value).
 //
 // skip_security_check: Set to true when calling validator functions to avoid infinite recursion
-static Value ExecuteFunctionInternal(ClientContext &context, const string &func_name,
-                                     const vector<Value> &args, bool skip_security_check) {
+static Value ExecuteFunctionInternal(ClientContext &context, const string &func_name, const vector<Value> &args,
+                                     bool skip_security_check) {
 	// Security check (unless skipped for validator calls)
 	if (!skip_security_check) {
 		if (!ValidateFunctionCall(context, func_name, args)) {
@@ -817,8 +806,8 @@ static unique_ptr<FunctionData> BindApplyWith(ClientContext &context, ScalarFunc
 				auto func_type = GetCallableFunctionType(context, func_name);
 				if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 					auto &catalog = Catalog::GetSystemCatalog(context);
-					auto func_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(
-					    context, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
+					auto func_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(context, DEFAULT_SCHEMA, func_name,
+					                                                               OnEntryNotFound::RETURN_NULL);
 					if (func_entry && !func_entry->functions.functions.empty()) {
 						auto &first_func = func_entry->functions.functions[0];
 						if (first_func.return_type.id() != LogicalTypeId::ANY) {
@@ -874,9 +863,8 @@ static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &
 			if (!kwargs_struct.IsNull() && kwargs_struct.type().id() == LogicalTypeId::STRUCT) {
 				auto &struct_children = StructValue::GetChildren(kwargs_struct);
 				if (!struct_children.empty()) {
-					throw InvalidInputException(
-					    "apply_with: kwargs (named parameters) are not yet supported. "
-					    "Use positional args instead.");
+					throw InvalidInputException("apply_with: kwargs (named parameters) are not yet supported. "
+					                            "Use positional args instead.");
 				}
 			}
 		}
@@ -1091,24 +1079,22 @@ static void SetSecurityModeScalarFun(DataChunk &args, ExpressionState &state, Ve
 	auto &context = state.GetContext();
 	auto &mode_vector = args.data[0];
 
-	UnaryExecutor::Execute<string_t, string_t>(
-	    mode_vector, result, args.size(),
-	    [&](string_t mode_str) {
-		    auto &config = GetSecurityConfig(context);
+	UnaryExecutor::Execute<string_t, string_t>(mode_vector, result, args.size(), [&](string_t mode_str) {
+		auto &config = GetSecurityConfig(context);
 
-		    if (config.locked) {
-			    throw InvalidInputException("func_apply security settings are locked");
-		    }
+		if (config.locked) {
+			throw InvalidInputException("func_apply security settings are locked");
+		}
 
-		    string mode = mode_str.GetString();
-		    if (mode != "none" && mode != "blacklist" && mode != "whitelist" && mode != "validator") {
-			    throw InvalidInputException("Invalid security mode: '%s'. Must be 'none', 'blacklist', 'whitelist', or 'validator'", mode);
-		    }
+		string mode = mode_str.GetString();
+		if (mode != "none" && mode != "blacklist" && mode != "whitelist" && mode != "validator") {
+			throw InvalidInputException(
+			    "Invalid security mode: '%s'. Must be 'none', 'blacklist', 'whitelist', or 'validator'", mode);
+		}
 
-		    config.mode = mode;
-		    return StringVector::AddString(result, "Security mode set to: " + mode);
-	    }
-	);
+		config.mode = mode;
+		return StringVector::AddString(result, "Security mode set to: " + mode);
+	});
 }
 
 // func_apply_set_blacklist(list LIST) -> VARCHAR
@@ -1175,19 +1161,16 @@ static void SetValidatorScalarFun(DataChunk &args, ExpressionState &state, Vecto
 	auto &context = state.GetContext();
 	auto &name_vector = args.data[0];
 
-	UnaryExecutor::Execute<string_t, string_t>(
-	    name_vector, result, args.size(),
-	    [&](string_t name_str) {
-		    auto &config = GetSecurityConfig(context);
+	UnaryExecutor::Execute<string_t, string_t>(name_vector, result, args.size(), [&](string_t name_str) {
+		auto &config = GetSecurityConfig(context);
 
-		    if (config.locked) {
-			    throw InvalidInputException("func_apply security settings are locked");
-		    }
+		if (config.locked) {
+			throw InvalidInputException("func_apply security settings are locked");
+		}
 
-		    config.validator_func = name_str.GetString();
-		    return StringVector::AddString(result, "Validator set to: " + config.validator_func);
-	    }
-	);
+		config.validator_func = name_str.GetString();
+		return StringVector::AddString(result, "Validator set to: " + config.validator_func);
+	});
 }
 
 // func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
@@ -1196,24 +1179,22 @@ static void SetOnBlockScalarFun(DataChunk &args, ExpressionState &state, Vector 
 	auto &context = state.GetContext();
 	auto &behavior_vector = args.data[0];
 
-	UnaryExecutor::Execute<string_t, string_t>(
-	    behavior_vector, result, args.size(),
-	    [&](string_t behavior_str) {
-		    auto &config = GetSecurityConfig(context);
+	UnaryExecutor::Execute<string_t, string_t>(behavior_vector, result, args.size(), [&](string_t behavior_str) {
+		auto &config = GetSecurityConfig(context);
 
-		    if (config.locked) {
-			    throw InvalidInputException("func_apply security settings are locked");
-		    }
+		if (config.locked) {
+			throw InvalidInputException("func_apply security settings are locked");
+		}
 
-		    string behavior = behavior_str.GetString();
-		    if (behavior != "error" && behavior != "null" && behavior != "default") {
-			    throw InvalidInputException("Invalid on_block behavior: '%s'. Must be 'error', 'null', or 'default'", behavior);
-		    }
+		string behavior = behavior_str.GetString();
+		if (behavior != "error" && behavior != "null" && behavior != "default") {
+			throw InvalidInputException("Invalid on_block behavior: '%s'. Must be 'error', 'null', or 'default'",
+			                            behavior);
+		}
 
-		    config.on_block = behavior;
-		    return StringVector::AddString(result, "On-block behavior set to: " + behavior);
-	    }
-	);
+		config.on_block = behavior;
+		return StringVector::AddString(result, "On-block behavior set to: " + behavior);
+	});
 }
 
 // func_apply_set_block_default(value ANY) -> VARCHAR
@@ -1270,7 +1251,8 @@ static void GetSecurityConfigScalarFun(DataChunk &args, ExpressionState &state, 
 		output += "  \"blacklist\": [";
 		bool first = true;
 		for (auto &func : config.blacklist) {
-			if (!first) output += ", ";
+			if (!first)
+				output += ", ";
 			output += "\"" + func + "\"";
 			first = false;
 		}
@@ -1279,7 +1261,8 @@ static void GetSecurityConfigScalarFun(DataChunk &args, ExpressionState &state, 
 		output += "  \"whitelist\": [";
 		first = true;
 		for (auto &func : config.whitelist) {
-			if (!first) output += ", ";
+			if (!first)
+				output += ", ";
 			output += "\"" + func + "\"";
 			first = false;
 		}
@@ -1293,13 +1276,12 @@ static void GetSecurityConfigScalarFun(DataChunk &args, ExpressionState &state, 
 
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register function_exists
-	auto function_exists_func = ScalarFunction("function_exists", {LogicalType::VARCHAR},
-	                                           LogicalType::BOOLEAN, FunctionExistsScalarFun);
+	auto function_exists_func =
+	    ScalarFunction("function_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, FunctionExistsScalarFun);
 	loader.RegisterFunction(function_exists_func);
 
 	// Register apply (variadic)
-	auto apply_func = ScalarFunction("apply", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyScalarFun,
-	                                 BindApply);
+	auto apply_func = ScalarFunction("apply", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyScalarFun, BindApply);
 	apply_func.varargs = LogicalType::ANY;
 	apply_func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(apply_func);
@@ -1307,9 +1289,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register apply_with (structured with named params support)
 	// Uses varargs to support: apply_with(func, args) or apply_with(func, args, kwargs)
 	// or named: apply_with(func, args := [...], kwargs := {...})
-	auto apply_with_func = ScalarFunction("apply_with",
-	                                       {LogicalType::VARCHAR},
-	                                       LogicalType::ANY, ApplyWithScalarFun, BindApplyWith);
+	auto apply_with_func =
+	    ScalarFunction("apply_with", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyWithScalarFun, BindApplyWith);
 	apply_with_func.varargs = LogicalType::ANY;
 	apply_with_func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(apply_with_func);
@@ -1335,51 +1316,43 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//===--------------------------------------------------------------------===//
 
 	// func_apply_set_security_mode(mode VARCHAR) -> VARCHAR
-	auto set_security_mode_func = ScalarFunction("func_apply_set_security_mode",
-	                                              {LogicalType::VARCHAR},
-	                                              LogicalType::VARCHAR, SetSecurityModeScalarFun);
+	auto set_security_mode_func = ScalarFunction("func_apply_set_security_mode", {LogicalType::VARCHAR},
+	                                             LogicalType::VARCHAR, SetSecurityModeScalarFun);
 	loader.RegisterFunction(set_security_mode_func);
 
 	// func_apply_set_blacklist(list LIST) -> VARCHAR
-	auto set_blacklist_func = ScalarFunction("func_apply_set_blacklist",
-	                                          {LogicalType::LIST(LogicalType::VARCHAR)},
-	                                          LogicalType::VARCHAR, SetBlacklistScalarFun);
+	auto set_blacklist_func = ScalarFunction("func_apply_set_blacklist", {LogicalType::LIST(LogicalType::VARCHAR)},
+	                                         LogicalType::VARCHAR, SetBlacklistScalarFun);
 	loader.RegisterFunction(set_blacklist_func);
 
 	// func_apply_set_whitelist(list LIST) -> VARCHAR
-	auto set_whitelist_func = ScalarFunction("func_apply_set_whitelist",
-	                                          {LogicalType::LIST(LogicalType::VARCHAR)},
-	                                          LogicalType::VARCHAR, SetWhitelistScalarFun);
+	auto set_whitelist_func = ScalarFunction("func_apply_set_whitelist", {LogicalType::LIST(LogicalType::VARCHAR)},
+	                                         LogicalType::VARCHAR, SetWhitelistScalarFun);
 	loader.RegisterFunction(set_whitelist_func);
 
 	// func_apply_set_validator(func_name VARCHAR) -> VARCHAR
-	auto set_validator_func = ScalarFunction("func_apply_set_validator",
-	                                          {LogicalType::VARCHAR},
-	                                          LogicalType::VARCHAR, SetValidatorScalarFun);
+	auto set_validator_func =
+	    ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetValidatorScalarFun);
 	loader.RegisterFunction(set_validator_func);
 
 	// func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
-	auto set_on_block_func = ScalarFunction("func_apply_set_on_block",
-	                                         {LogicalType::VARCHAR},
-	                                         LogicalType::VARCHAR, SetOnBlockScalarFun);
+	auto set_on_block_func =
+	    ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetOnBlockScalarFun);
 	loader.RegisterFunction(set_on_block_func);
 
 	// func_apply_set_block_default(value ANY) -> VARCHAR
-	auto set_block_default_func = ScalarFunction("func_apply_set_block_default",
-	                                              {LogicalType::ANY},
-	                                              LogicalType::VARCHAR, SetBlockDefaultScalarFun);
+	auto set_block_default_func = ScalarFunction("func_apply_set_block_default", {LogicalType::ANY},
+	                                             LogicalType::VARCHAR, SetBlockDefaultScalarFun);
 	loader.RegisterFunction(set_block_default_func);
 
 	// func_apply_lock_security() -> VARCHAR
-	auto lock_security_func = ScalarFunction("func_apply_lock_security",
-	                                          {},
-	                                          LogicalType::VARCHAR, LockSecurityScalarFun);
+	auto lock_security_func =
+	    ScalarFunction("func_apply_lock_security", {}, LogicalType::VARCHAR, LockSecurityScalarFun);
 	loader.RegisterFunction(lock_security_func);
 
 	// func_apply_get_security_config() -> VARCHAR
-	auto get_security_config_func = ScalarFunction("func_apply_get_security_config",
-	                                                {},
-	                                                LogicalType::VARCHAR, GetSecurityConfigScalarFun);
+	auto get_security_config_func =
+	    ScalarFunction("func_apply_get_security_config", {}, LogicalType::VARCHAR, GetSecurityConfigScalarFun);
 	loader.RegisterFunction(get_security_config_func);
 }
 
