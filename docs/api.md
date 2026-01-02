@@ -174,6 +174,141 @@ SELECT apply_with('random', args := NULL) IS NOT NULL;
 
 ---
 
+## apply_table
+
+Dynamically calls a table function by name.
+
+### Signature
+
+```sql
+apply_table(func_name VARCHAR, ...args ANY) -> TABLE
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `func_name` | `VARCHAR` | Name of the table function to call |
+| `...args` | `ANY` | Arguments to pass to the function |
+
+### Returns
+
+A table with columns determined by the called table function.
+
+### Description
+
+`apply_table()` invokes any table function by name, returning its results as a table. This is useful for dynamic data generation and parameterized table access.
+
+### Examples
+
+**Basic usage:**
+
+```sql
+SELECT * FROM apply_table('range', 5);
+-- Returns: 0, 1, 2, 3, 4
+
+SELECT * FROM apply_table('generate_series', 1, 10, 2);
+-- Returns: 1, 3, 5, 7, 9
+```
+
+**With joins:**
+
+```sql
+SELECT d.*, r.range as idx
+FROM my_data d
+CROSS JOIN apply_table('range', 3) r;
+```
+
+**In subqueries:**
+
+```sql
+SELECT * FROM my_table
+WHERE id IN (SELECT range FROM apply_table('range', 100));
+```
+
+**Dynamic row generation:**
+
+```sql
+-- Generate rows based on a column value
+SELECT d.id, r.range as position
+FROM data d
+CROSS JOIN LATERAL apply_table('range', d.count) r;
+```
+
+### Errors
+
+| Error | Cause |
+|-------|-------|
+| `invalid function name` | Function name contains invalid characters |
+| `function does not exist` | No table function with that name found |
+| `is a scalar function` | Function exists but is scalar (use `apply()` instead) |
+
+---
+
+## apply_table_with
+
+Calls a table function with arguments provided as a list.
+
+### Signature
+
+```sql
+apply_table_with(func_name VARCHAR, args LIST, kwargs STRUCT) -> TABLE
+apply_table_with(func_name VARCHAR, args := LIST) -> TABLE
+apply_table_with(func_name VARCHAR, args := LIST, kwargs := STRUCT) -> TABLE
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `func_name` | `VARCHAR` | Name of the table function to call |
+| `args` | `LIST` | Positional arguments as a list |
+| `kwargs` | `STRUCT` | Named arguments as a struct |
+
+### Returns
+
+A table with columns determined by the called table function.
+
+### Description
+
+`apply_table_with()` provides an alternative way to call table functions where arguments are passed as a list or struct. Unlike `apply_with()` for scalar functions, `apply_table_with()` fully supports `kwargs` for named parameters.
+
+### Examples
+
+**Basic usage:**
+
+```sql
+SELECT * FROM apply_table_with('range', args := [5]);
+-- Returns: 0, 1, 2, 3, 4
+```
+
+**With kwargs:**
+
+```sql
+SELECT * FROM apply_table_with('generate_series',
+    args := [1],
+    kwargs := {stop: 10, step: 2}
+);
+-- Returns: 1, 3, 5, 7, 9
+```
+
+**Positional syntax:**
+
+```sql
+SELECT * FROM apply_table_with('range', [10], NULL);
+-- Returns: 0, 1, 2, ..., 9
+```
+
+### Errors
+
+| Error | Cause |
+|-------|-------|
+| `invalid function name` | Function name contains invalid characters |
+| `function does not exist` | No table function with that name found |
+| `is a scalar function` | Function exists but is scalar (use `apply_with()` instead) |
+
+---
+
 ## function_exists
 
 Checks if a function with the given name exists.

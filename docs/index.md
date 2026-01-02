@@ -39,8 +39,10 @@ JOIN transforms ON data.type = transforms.data_type;
 
 | Function | Description |
 |----------|-------------|
-| [`apply()`](api.md#apply) | Call a function by name with arguments |
-| [`apply_with()`](api.md#apply_with) | Call a function with args as a list |
+| [`apply()`](api.md#apply) | Call a scalar function by name with arguments |
+| [`apply_with()`](api.md#apply_with) | Call a scalar function with args as a list |
+| [`apply_table()`](api.md#apply_table) | Call a table function by name with arguments |
+| [`apply_table_with()`](api.md#apply_table_with) | Call a table function with args as a list |
 | [`function_exists()`](api.md#function_exists) | Check if a function exists |
 
 ## Contents
@@ -53,13 +55,13 @@ JOIN transforms ON data.type = transforms.data_type;
 
 FuncApply works with:
 
-- **Scalar functions** - `upper`, `lower`, `abs`, `substr`, etc.
-- **Macros** - `list_sum`, `list_reverse`, custom macros
+- **Scalar functions** - `upper`, `lower`, `abs`, `substr`, etc. (via `apply`, `apply_with`)
+- **Macros** - `list_sum`, `list_reverse`, custom macros (via `apply`, `apply_with`)
+- **Table functions** - `range`, `generate_series`, etc. (via `apply_table`, `apply_table_with`)
 
 Not yet supported:
 
 - Aggregate functions (`sum`, `avg`, `count`)
-- Table functions (`read_csv`, `range`)
 - Window functions
 
 ## Next Steps

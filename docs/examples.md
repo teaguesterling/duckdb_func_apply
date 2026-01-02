@@ -277,6 +277,68 @@ FROM products
 GROUP BY category;
 ```
 
+## Table Functions
+
+### Dynamic Row Generation
+
+```sql
+-- Generate a sequence dynamically
+SELECT * FROM apply_table('range', 10);
+-- Returns: 0, 1, 2, ..., 9
+
+-- Generate series with step
+SELECT * FROM apply_table('generate_series', 0, 100, 10);
+-- Returns: 0, 10, 20, ..., 100
+```
+
+### Data Expansion with Cross Join
+
+```sql
+-- Repeat each row a variable number of times
+CREATE TABLE items (name VARCHAR, repeat_count INT);
+INSERT INTO items VALUES ('A', 2), ('B', 3), ('C', 1);
+
+SELECT i.name, r.range as instance
+FROM items i
+CROSS JOIN apply_table('range', i.repeat_count) r;
+-- Returns:
+-- A, 0
+-- A, 1
+-- B, 0
+-- B, 1
+-- B, 2
+-- C, 0
+```
+
+### Using apply_table_with for Structured Calls
+
+```sql
+-- With args list
+SELECT * FROM apply_table_with('range', args := [5]);
+
+-- With kwargs struct
+SELECT * FROM apply_table_with('generate_series',
+    args := [1],
+    kwargs := {stop: 10, step: 2}
+);
+```
+
+### Dynamic Table Function Selection
+
+```sql
+-- Choose table function based on condition
+SELECT *
+FROM (
+    SELECT CASE
+        WHEN use_range THEN 'range'
+        ELSE 'generate_series'
+    END as func_name,
+    10 as arg1
+    FROM config
+) params
+CROSS JOIN LATERAL apply_table(params.func_name, params.arg1);
+```
+
 ## Error Handling
 
 ### Graceful Degradation

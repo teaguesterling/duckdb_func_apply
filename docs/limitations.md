@@ -19,18 +19,6 @@ SELECT sum(column_name) FROM table;
 SELECT apply('list_aggregate', [1, 2, 3], 'sum');  -- Works!
 ```
 
-### Table Functions
-
-Table functions like `read_csv`, `range`, `generate_series` are not supported.
-
-```sql
--- This does NOT work:
-SELECT * FROM apply('read_csv', 'file.csv');  -- Error!
-
--- Workaround: Use native SQL
-SELECT * FROM read_csv('file.csv');
-```
-
 ### Window Functions
 
 Window functions are not supported through `apply()`.
@@ -159,7 +147,6 @@ By default, certain dangerous functions may be blacklisted (see [Security](inter
 Planned features for future releases:
 
 1. **JSON args support** - Allow heterogeneous arguments via JSON
-2. **kwargs support** - Named parameters via struct
+2. **kwargs support for apply_with()** - Named parameters via struct for scalar functions
 3. **Aggregate function support** - Call aggregates dynamically
-4. **Table function support** - `apply_table()` for table functions
-5. **Partial application** - `partial()` for currying functions
+4. **Partial application** - `partial()` for currying functions
