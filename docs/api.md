@@ -427,3 +427,219 @@ When the function name is dynamic (from a column), the return type defaults to `
 SELECT typeof(apply(func_col, 'hello')) FROM ...;
 -- Result: VARCHAR (default)
 ```
+
+---
+
+## Security Configuration
+
+FuncApply includes a configurable security model to control which functions can be called dynamically. This is essential for multi-tenant environments or when allowing user-provided function names.
+
+### Security Modes
+
+| Mode | Description |
+|------|-------------|
+| `none` | No restrictions (default) |
+| `blacklist` | Block specific functions (allow all others) |
+| `whitelist` | Only allow specific functions (block all others) |
+| `validator` | Call a custom macro to validate each call |
+
+### func_apply_set_security_mode
+
+Sets the security mode for dynamic function calls.
+
+```sql
+func_apply_set_security_mode(mode VARCHAR) -> VARCHAR
+```
+
+**Example:**
+
+```sql
+SELECT func_apply_set_security_mode('blacklist');
+-- Result: Security mode set to: blacklist
+```
+
+### func_apply_set_blacklist
+
+Sets the list of functions to block (used in blacklist mode).
+
+```sql
+func_apply_set_blacklist(functions LIST) -> VARCHAR
+```
+
+**Example:**
+
+```sql
+SELECT func_apply_set_blacklist(['system', 'load', 'eval']);
+-- Result: Blacklist set with 3 functions
+```
+
+**Default blacklist:** `system`, `getenv`, `load`, `install`, `uninstall`, `force_install`, `export_database`, `import_database`, `create_secret`, `drop_secret`
+
+### func_apply_set_whitelist
+
+Sets the list of functions to allow (used in whitelist mode).
+
+```sql
+func_apply_set_whitelist(functions LIST) -> VARCHAR
+```
+
+**Example:**
+
+```sql
+SELECT func_apply_set_whitelist(['upper', 'lower', 'concat', 'substr']);
+-- Result: Whitelist set with 4 functions
+```
+
+### func_apply_set_validator
+
+Sets a custom validator function (used in validator mode).
+
+```sql
+func_apply_set_validator(func_name VARCHAR) -> VARCHAR
+```
+
+The validator function/macro must have the signature:
+
+```sql
+validator(func_name VARCHAR, params STRUCT) -> BOOLEAN
+```
+
+Where `params` has the structure:
+
+```sql
+{
+    total_args: INTEGER,                    -- Total number of arguments
+    positional: {
+        arg_indexes: VARCHAR[],             -- ['1', '2', '3', ...]
+        arg_types: VARCHAR[],               -- ['VARCHAR', 'INTEGER', ...]
+        arg_values: STRUCT                  -- {'1': val1, '2': val2, ...}
+    },
+    named: {
+        arg_names: VARCHAR[],               -- ['start', 'length', ...]
+        arg_types: VARCHAR[],               -- ['INTEGER', 'INTEGER', ...]
+        arg_values: STRUCT                  -- {'start': 7, 'length': 5, ...}
+    }
+}
+```
+
+**Example:**
+
+```sql
+-- Create a validator that allows specific functions and limits arg count
+CREATE MACRO my_validator(func_name, params) AS (
+    func_name IN ('upper', 'lower', 'concat')
+    AND params.total_args <= 5
+);
+
+SELECT func_apply_set_security_mode('validator');
+SELECT func_apply_set_validator('my_validator');
+
+SELECT apply('upper', 'hello');  -- Works
+SELECT apply('system', 'ls');     -- Blocked
+```
+
+### func_apply_set_on_block
+
+Configures what happens when a function call is blocked.
+
+```sql
+func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
+```
+
+| Behavior | Description |
+|----------|-------------|
+| `error` | Throw an error (default) |
+| `null` | Return NULL |
+| `default` | Return a configured default value |
+
+**Example:**
+
+```sql
+SELECT func_apply_set_on_block('null');
+-- Blocked calls now return NULL instead of throwing
+
+SELECT func_apply_set_on_block('default');
+SELECT func_apply_set_block_default('BLOCKED');
+-- Blocked calls now return 'BLOCKED'
+```
+
+### func_apply_set_block_default
+
+Sets the default value returned when `on_block` is `'default'`.
+
+```sql
+func_apply_set_block_default(value ANY) -> VARCHAR
+```
+
+### func_apply_lock_security
+
+Locks the security configuration, preventing any further changes. **This is irreversible for the session.**
+
+```sql
+func_apply_lock_security() -> VARCHAR
+```
+
+**Example:**
+
+```sql
+-- Configure security
+SELECT func_apply_set_security_mode('whitelist');
+SELECT func_apply_set_whitelist(['upper', 'lower']);
+
+-- Lock it
+SELECT func_apply_lock_security();
+-- Result: Security settings locked (cannot be unlocked)
+
+-- This will now fail
+SELECT func_apply_set_security_mode('none');
+-- Error: Security settings are locked
+```
+
+### func_apply_get_security_config
+
+Returns the current security configuration as JSON.
+
+```sql
+func_apply_get_security_config() -> VARCHAR
+```
+
+**Example:**
+
+```sql
+SELECT func_apply_get_security_config();
+-- Result:
+-- {
+--   "mode": "whitelist",
+--   "on_block": "error",
+--   "locked": false,
+--   "validator": "",
+--   "blacklist": [...],
+--   "whitelist": ["upper", "lower"]
+-- }
+```
+
+### Complete Security Example
+
+```sql
+-- Load extension
+LOAD 'func_apply';
+
+-- Set up whitelist mode with safe functions
+SELECT func_apply_set_security_mode('whitelist');
+SELECT func_apply_set_whitelist([
+    'upper', 'lower', 'concat', 'substr', 'length',
+    'abs', 'round', 'floor', 'ceil',
+    'date_part', 'current_date'
+]);
+
+-- Configure graceful handling of blocked calls
+SELECT func_apply_set_on_block('default');
+SELECT func_apply_set_block_default('ACCESS_DENIED');
+
+-- Lock the configuration
+SELECT func_apply_lock_security();
+
+-- Now dynamic calls are safe
+SELECT apply(user_func, user_data) FROM user_requests;
+-- Only whitelisted functions work; others return 'ACCESS_DENIED'
+```

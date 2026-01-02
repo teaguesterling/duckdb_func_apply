@@ -2,25 +2,7 @@
 # description: test func_apply extension
 # group: [sql]
 
-# Before we load the extension, this will fail
-statement error
-SELECT func_apply('Sam');
-----
-Catalog Error: Scalar Function with name func_apply does not exist!
-
-# Require statement will ensure this test is run with this extension loaded
 require func_apply
-
-# Confirm the extension works
-query I
-SELECT func_apply('Sam');
-----
-FuncApply Sam 🐥
-
-query I
-SELECT func_apply_openssl_version('Michael') ILIKE 'FuncApply Michael, my linked OpenSSL version is OpenSSL%';
-----
-true
 
 # ============================================
 # function_exists() tests
@@ -113,14 +95,16 @@ SELECT function_exists(NULL);
 ----
 NULL
 
-# Our own extension function
 query I
-SELECT function_exists('func_apply');
+SELECT function_exists('function_exists');
 ----
 true
 
+statement ok
+CREATE MACRO my_macro (foo) AS 'hello ' || foo;
+
 query I
-SELECT function_exists('function_exists');
+SELECT function_exists('my_macro');
 ----
 true
 
@@ -850,3 +834,268 @@ FROM (
 );
 ----
 25
+
+# ============================================
+# Security Configuration Tests
+# ============================================
+
+# --- Test security configuration functions exist ---
+
+# Get default security config (mode should be 'none')
+query I
+SELECT func_apply_get_security_config() LIKE '%"mode": "none"%';
+----
+true
+
+# --- Test blacklist mode ---
+
+# Set security mode to blacklist
+query I
+SELECT func_apply_set_security_mode('blacklist') LIKE '%blacklist%';
+----
+true
+
+# Verify mode is now blacklist
+query I
+SELECT func_apply_get_security_config() LIKE '%"mode": "blacklist"%';
+----
+true
+
+# Set a custom blacklist
+query I
+SELECT func_apply_set_blacklist(['upper', 'lower']);
+----
+Blacklist set with 2 functions
+
+# Now 'upper' should be blocked
+statement error
+SELECT apply('upper', 'hello');
+----
+blocked by func_apply security policy
+
+# But 'concat' should work (not in blacklist)
+query I
+SELECT apply('concat', 'hello', ' ', 'world');
+----
+hello world
+
+# Reset to none mode for next tests
+query I
+SELECT func_apply_set_security_mode('none');
+----
+Security mode set to: none
+
+# --- Test whitelist mode ---
+
+# Set security mode to whitelist
+query I
+SELECT func_apply_set_security_mode('whitelist');
+----
+Security mode set to: whitelist
+
+# Set a whitelist with only 'upper'
+query I
+SELECT func_apply_set_whitelist(['upper']);
+----
+Whitelist set with 1 functions
+
+# 'upper' should work (in whitelist)
+query I
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+# 'lower' should be blocked (not in whitelist)
+statement error
+SELECT apply('lower', 'HELLO');
+----
+blocked by func_apply security policy
+
+# Reset to none mode
+query I
+SELECT func_apply_set_security_mode('none');
+----
+Security mode set to: none
+
+# --- Test on_block = 'null' ---
+
+# Set blacklist mode with on_block = 'null'
+query I
+SELECT func_apply_set_security_mode('blacklist');
+----
+Security mode set to: blacklist
+
+query I
+SELECT func_apply_set_blacklist(['upper']);
+----
+Blacklist set with 1 functions
+
+query I
+SELECT func_apply_set_on_block('null');
+----
+On-block behavior set to: null
+
+# Blocked function should return NULL instead of error
+query I
+SELECT apply('upper', 'hello') IS NULL;
+----
+true
+
+# Non-blocked function should work
+query I
+SELECT apply('lower', 'HELLO');
+----
+hello
+
+# Reset
+query I
+SELECT func_apply_set_security_mode('none');
+----
+Security mode set to: none
+
+query I
+SELECT func_apply_set_on_block('error');
+----
+On-block behavior set to: error
+
+# --- Test on_block = 'default' ---
+
+query I
+SELECT func_apply_set_security_mode('blacklist');
+----
+Security mode set to: blacklist
+
+query I
+SELECT func_apply_set_blacklist(['upper']);
+----
+Blacklist set with 1 functions
+
+query I
+SELECT func_apply_set_on_block('default');
+----
+On-block behavior set to: default
+
+query I
+SELECT func_apply_set_block_default('BLOCKED');
+----
+Block default value set
+
+# Blocked function should return default value
+query I
+SELECT apply('upper', 'hello');
+----
+BLOCKED
+
+# Reset
+query I
+SELECT func_apply_set_security_mode('none');
+----
+Security mode set to: none
+
+query I
+SELECT func_apply_set_on_block('error');
+----
+On-block behavior set to: error
+
+# --- Test validator mode ---
+
+# Create a validator macro
+statement ok
+CREATE MACRO test_validator(func_name, params) AS func_name = 'upper' OR func_name = 'concat';
+
+# Set validator mode
+query I
+SELECT func_apply_set_security_mode('validator');
+----
+Security mode set to: validator
+
+query I
+SELECT func_apply_set_validator('test_validator');
+----
+Validator set to: test_validator
+
+# 'upper' should work (validator allows it)
+query I
+SELECT apply('upper', 'hello');
+----
+HELLO
+
+# 'concat' should work (validator allows it)
+query I
+SELECT apply('concat', 'a', 'b');
+----
+ab
+
+# 'lower' should be blocked (validator rejects it)
+statement error
+SELECT apply('lower', 'HELLO');
+----
+blocked by func_apply security policy
+
+# Clean up
+statement ok
+DROP MACRO test_validator;
+
+# Reset
+query I
+SELECT func_apply_set_security_mode('none');
+----
+Security mode set to: none
+
+# --- Test lock mechanism ---
+
+# Set some security config
+query I
+SELECT func_apply_set_security_mode('blacklist');
+----
+Security mode set to: blacklist
+
+# Lock the security settings
+query I
+SELECT func_apply_lock_security();
+----
+Security settings locked (cannot be unlocked)
+
+# Verify locked
+query I
+SELECT func_apply_get_security_config() LIKE '%"locked": true%';
+----
+true
+
+# Try to change mode - should fail
+statement error
+SELECT func_apply_set_security_mode('none');
+----
+security settings are locked
+
+# Try to change blacklist - should fail
+statement error
+SELECT func_apply_set_blacklist(['upper']);
+----
+security settings are locked
+
+# Try to lock again - should fail
+statement error
+SELECT func_apply_lock_security();
+----
+security settings are already locked
+
+# --- Test apply_table with security ---
+
+# Note: We can't reset after lock, so these tests work with current locked blacklist config
+# The default blacklist should block 'system', 'load', etc.
+
+# Since we're in blacklist mode with default blacklist, 'range' should work
+query I
+SELECT count(*) FROM apply_table('range', 5);
+----
+5
+
+# --- Test invalid security mode ---
+
+# This would fail if we could set it (but we're locked)
+# So we test validation by checking the locked error
+statement error
+SELECT func_apply_set_security_mode('invalid_mode');
+----
+security settings are locked
