@@ -8,6 +8,7 @@ The FuncApply extension provides dynamic function invocation capabilities for Du
 
 - Call any scalar function or macro by name using `apply()`
 - Pass arguments dynamically using `apply_with()`
+- Call table functions dynamically using `apply_table()` and `apply_table_with()`
 - Check if functions exist with `function_exists()`
 
 This is useful for data-driven transformations, dynamic SQL generation, and building flexible data pipelines.
@@ -18,12 +19,19 @@ This is useful for data-driven transformations, dynamic SQL generation, and buil
 -- Load the extension
 LOAD func_apply;
 
--- Call functions dynamically
+-- Call scalar functions dynamically
 SELECT apply('upper', 'hello world');
 -- Result: HELLO WORLD
 
-SELECT apply('substr', 'hello world', start := 7, length := 5);
+SELECT apply('substr', 'hello world', 7, 5);
 -- Result: world
+
+-- Call table functions dynamically
+SELECT * FROM apply_table('range', 5);
+-- Returns: 0, 1, 2, 3, 4
+
+SELECT * FROM apply_table('generate_series', 1, 10, 2);
+-- Returns: 1, 3, 5, 7, 9
 
 -- Check if a function exists before calling
 SELECT function_exists('my_custom_func');
@@ -70,6 +78,46 @@ SELECT apply_with('concat', ['a', 'b', 'c'], NULL);
 
 **Note:** DuckDB lists must be homogeneous (same type). For mixed-type arguments, use `apply()` directly.
 
+### `apply_table(func_name, ...args)`
+
+Calls a table function by name and returns its results as a table.
+
+```sql
+-- Basic range
+SELECT * FROM apply_table('range', 5);
+-- Returns: 0, 1, 2, 3, 4
+
+-- Generate series with step
+SELECT * FROM apply_table('generate_series', 1, 10, 2);
+-- Returns: 1, 3, 5, 7, 9
+
+-- Use in joins
+SELECT d.*, r.range as idx
+FROM my_data d
+CROSS JOIN apply_table('range', 3) r;
+
+-- Use in subqueries
+SELECT * FROM my_table
+WHERE id IN (SELECT range FROM apply_table('range', 100));
+```
+
+### `apply_table_with(func_name, args, kwargs)`
+
+Calls a table function with arguments provided as a list and optional named parameters.
+
+```sql
+-- Basic usage
+SELECT * FROM apply_table_with('range', args := [5]);
+-- Returns: 0, 1, 2, 3, 4
+
+-- With named parameters
+SELECT * FROM apply_table_with('generate_series',
+    args := [1],
+    kwargs := {stop: 10, step: 2}
+);
+-- Returns: 1, 3, 5, 7, 9
+```
+
 ### `function_exists(name)`
 
 Returns true if a function with the given name exists.
@@ -88,12 +136,12 @@ FROM my_table;
 
 ## Supported Function Types
 
-| Type | Supported | Example |
-|------|-----------|---------|
-| Scalar functions | Yes | `upper`, `abs`, `substr` |
-| Macros | Yes | `list_sum`, `list_reverse` |
-| Aggregate functions | No | `sum`, `avg` |
-| Table functions | No | `read_csv`, `range` |
+| Type | Supported | Functions to Use | Example |
+|------|-----------|------------------|---------|
+| Scalar functions | Yes | `apply`, `apply_with` | `upper`, `abs`, `substr` |
+| Macros | Yes | `apply`, `apply_with` | `list_sum`, `list_reverse` |
+| Table functions | Yes | `apply_table`, `apply_table_with` | `range`, `generate_series` |
+| Aggregate functions | No | N/A | `sum`, `avg` |
 
 ## Use Cases
 
@@ -142,6 +190,19 @@ SELECT
          ELSE 'Function not found'
     END as result
 FROM function_list;
+```
+
+### Dynamic Table Generation
+
+```sql
+-- Generate dynamic row counts based on configuration
+SELECT * FROM apply_table('range', row_count)
+WHERE row_count = (SELECT max_rows FROM config);
+
+-- Use table functions in cross joins for data expansion
+SELECT d.*, idx.range as position
+FROM my_data d
+CROSS JOIN apply_table('range', d.repeat_count) idx;
 ```
 
 ## Building

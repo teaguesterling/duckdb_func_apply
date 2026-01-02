@@ -1,5 +1,56 @@
 #define DUCKDB_EXTENSION_MAIN
 
+//===--------------------------------------------------------------------===//
+// func_apply Extension - Dynamic Function Invocation for DuckDB
+//===--------------------------------------------------------------------===//
+//
+// This extension provides dynamic function invocation capabilities:
+//
+// SCALAR FUNCTIONS:
+//   - apply(func, ...args) - Call a scalar function or macro by name
+//   - apply_with(func, args := [...], kwargs := {...}) - Structured call
+//   - function_exists(func) - Check if a function exists
+//
+// TABLE FUNCTIONS:
+//   - apply_table(func, ...args) - Call a table function by name
+//   - apply_table_with(func, args := [...], kwargs := {...}) - Structured call
+//
+//===--------------------------------------------------------------------===//
+// IMPORTANT IMPLEMENTATION NOTES FOR FUTURE DEVELOPERS
+//===--------------------------------------------------------------------===//
+//
+// 1. DUCKDB CATALOG API QUIRK:
+//    DuckDB's catalog.GetEntry(context, type, schema, name, ...) does NOT
+//    filter by CatalogType! It returns any entry matching the name regardless
+//    of type. You MUST verify entry->type matches the requested type yourself.
+//
+//    The EntryLookupInfo API DOES check type but throws an exception on
+//    mismatch instead of returning null.
+//
+//    See FunctionExistsOfType() for the correct pattern.
+//
+// 2. FUNCTION TYPE HIERARCHY:
+//    DuckDB has several function types that "functions" can be:
+//    - SCALAR_FUNCTION_ENTRY: Native scalar functions (upper, abs, etc.)
+//    - MACRO_ENTRY: SQL macros (list_sum, etc. - many "functions" are macros!)
+//    - TABLE_FUNCTION_ENTRY: Table functions (range, read_csv, etc.)
+//    - AGGREGATE_FUNCTION_ENTRY: Aggregate functions (sum, count, etc.)
+//
+//    Many functions that seem like scalar functions are actually macros.
+//    For example, list_sum is a MACRO, not a SCALAR_FUNCTION.
+//
+// 3. FUNCTION TYPE CHECKING ORDER:
+//    When looking up a function by name, the order of type checks matters.
+//    Some functions (like 'range') exist as both scalar AND table functions.
+//    GetCallableFunctionType() checks SCALAR first, then MACRO.
+//
+// 4. BIND vs EXECUTE PATHS:
+//    - Scalar functions: Use FunctionBinder directly (fast, avoids deadlock)
+//    - Macros: Must use full expression binding via ConstantBinder
+//    - Table functions: Use bind_replace to generate SQL dynamically
+//
+//===--------------------------------------------------------------------===//
+
 #include "func_apply_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -21,6 +72,10 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 // OpenSSL linked through vcpkg
 #include <openssl/opensslv.h>
@@ -187,37 +242,75 @@ static string ValueToSQL(const Value &val) {
 	}
 }
 
-// Helper to determine the catalog type of a function
-// Uses cross-catalog search to find functions in any catalog (system, temp, user-defined)
-static CatalogType GetFunctionCatalogType(ClientContext &context, const string &func_name) {
-	// Check in order of likelihood
-	static const vector<CatalogType> function_types = {
+// Helper to check if a function of a specific type exists
+//
+// IMPORTANT DISCOVERY: DuckDB's catalog.GetEntry(context, type, schema, name, ...)
+// does NOT filter by type! It returns any entry with that name regardless of type.
+// We MUST verify entry->type matches the requested type ourselves.
+//
+// The EntryLookupInfo API (Catalog::GetEntry with EntryLookupInfo) DOES check type
+// but throws an exception on mismatch instead of returning null.
+//
+// Neither API does what we want (return null on type mismatch), so we use the
+// non-throwing version and add our own type check.
+static bool FunctionExistsOfType(ClientContext &context, const string &func_name, CatalogType type) {
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto entry = catalog.GetEntry(context, type, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
+
+	if (entry) {
+		// CRITICAL: Verify the entry type matches what we asked for!
+		// The catalog returns any entry with the name, regardless of type.
+		if (entry->type != type) {
+			return false;
+		}
+	}
+
+	return entry != nullptr;
+}
+
+// Helper to find what type of callable function exists (for apply/apply_with)
+// Returns the type of the first matching callable (scalar or macro), or INVALID if not found
+// This specifically excludes table functions since those require apply_table
+//
+// NOTE: Order matters - we check SCALAR first, then MACRO. This means if a function
+// exists as both (rare), we prefer the scalar version.
+static CatalogType GetCallableFunctionType(ClientContext &context, const string &func_name) {
+	// Order matters: prefer scalar functions, then macros
+	// We exclude table functions - those must be called via apply_table
+	static const vector<CatalogType> callable_types = {
 	    CatalogType::SCALAR_FUNCTION_ENTRY,
-	    CatalogType::MACRO_ENTRY,
-	    CatalogType::AGGREGATE_FUNCTION_ENTRY,
-	    CatalogType::TABLE_FUNCTION_ENTRY
+	    CatalogType::MACRO_ENTRY
 	};
 
-	for (auto type : function_types) {
-		// Use static Catalog::GetEntry which searches across all catalogs
-		EntryLookupInfo lookup_info(type, func_name);
-		auto entry = Catalog::GetEntry(context, INVALID_CATALOG, DEFAULT_SCHEMA, lookup_info,
-		                               OnEntryNotFound::RETURN_NULL);
-		if (entry) {
-			return entry->type;
+	for (auto type : callable_types) {
+		if (FunctionExistsOfType(context, func_name, type)) {
+			return type;
 		}
 	}
 	return CatalogType::INVALID;
 }
 
+// Helper to check if a table function exists (for apply_table/apply_table_with)
+static bool TableFunctionExists(ClientContext &context, const string &func_name) {
+	return FunctionExistsOfType(context, func_name, CatalogType::TABLE_FUNCTION_ENTRY);
+}
+
 // Execute a function by name with given argument values
 // Uses expression-based execution to avoid query planner deadlock
 // Handles both scalar functions and macros
+//
+// NOTE: This is called at runtime for each row. The function type was already
+// determined at bind time in BindApply, but we re-check here because the function
+// name could be dynamic (coming from a column value).
 static Value ExecuteFunction(ClientContext &context, const string &func_name, const vector<Value> &args) {
-	// Check the function type first
-	auto func_type = GetFunctionCatalogType(context, func_name);
+	// Check the function type first (only scalar functions and macros are callable)
+	auto func_type = GetCallableFunctionType(context, func_name);
 
 	if (func_type == CatalogType::INVALID) {
+		// Check if it's a table function to give a better error message
+		if (TableFunctionExists(context, func_name)) {
+			throw InvalidInputException("Function '%s' is a table function. Use apply_table() instead.", func_name);
+		}
 		throw InvalidInputException("Function '%s' does not exist", func_name);
 	}
 
@@ -245,7 +338,8 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 
 	if (func_type == CatalogType::MACRO_ENTRY) {
 		// For macros, we need to use the full expression binding path
-		// Create a parsed FunctionExpression and bind it through ConstantBinder
+		// Macros are SQL expressions that get expanded, so we can't use FunctionBinder.
+		// Instead, create a parsed FunctionExpression and bind it through ConstantBinder.
 		vector<unique_ptr<ParsedExpression>> parsed_args;
 		for (auto &arg : args) {
 			parsed_args.push_back(make_uniq<ConstantExpression>(arg));
@@ -254,6 +348,7 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 		unique_ptr<ParsedExpression> func_expr = make_uniq<FunctionExpression>(func_name, std::move(parsed_args));
 
 		// Create a binder and use ConstantBinder to bind the expression
+		// ConstantBinder is designed for binding expressions in a constant context
 		auto binder = Binder::CreateBinder(context);
 		ConstantBinder constant_binder(*binder, context, "apply");
 		auto bind_result = constant_binder.Bind(func_expr);
@@ -262,6 +357,7 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 	}
 
 	// For other types (aggregates, table functions), throw an error
+	// This shouldn't happen if GetCallableFunctionType works correctly
 	throw InvalidInputException("Function '%s' is not a scalar function or macro", func_name);
 }
 
@@ -296,11 +392,12 @@ static unique_ptr<FunctionData> BindApply(ClientContext &context, ScalarFunction
 		return nullptr;
 	}
 
-	// Check the function type
-	auto func_type = GetFunctionCatalogType(context, func_name);
+	// Check the function type (only scalar functions and macros are callable via apply)
+	auto func_type = GetCallableFunctionType(context, func_name);
 
 	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		// For scalar functions, use FunctionBinder directly
+		// FunctionBinder handles overload resolution and type coercion automatically
 		vector<unique_ptr<Expression>> target_args;
 		for (idx_t i = 1; i < arguments.size(); i++) {
 			target_args.push_back(arguments[i]->Copy());
@@ -444,7 +541,7 @@ static unique_ptr<FunctionData> BindApplyWith(ClientContext &context, ScalarFunc
 		if (!func_name_val.IsNull()) {
 			string func_name = StringValue::Get(func_name_val);
 			if (IsValidIdentifier(func_name)) {
-				auto func_type = GetFunctionCatalogType(context, func_name);
+				auto func_type = GetCallableFunctionType(context, func_name);
 				if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 					auto &catalog = Catalog::GetSystemCatalog(context);
 					auto func_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(
@@ -521,6 +618,166 @@ static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// apply_table(func VARCHAR, ...args ANY) -> TABLE
+//===--------------------------------------------------------------------===//
+
+// Helper function to parse a query into a SubqueryRef
+static unique_ptr<SubqueryRef> ParseSubquery(const string &query, const ParserOptions &options) {
+	Parser parser(options);
+	parser.ParseQuery(query);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw BinderException("apply_table: expected a single SELECT statement from generated query");
+	}
+	auto select_stmt = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	return make_uniq<SubqueryRef>(std::move(select_stmt));
+}
+
+// bind_replace for apply_table: generates SQL and replaces with subquery
+static unique_ptr<TableRef> ApplyTableBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	// First argument is the function name
+	if (input.inputs.empty()) {
+		throw BinderException("apply_table requires at least a function name");
+	}
+
+	auto &func_name_val = input.inputs[0];
+	if (func_name_val.IsNull()) {
+		throw BinderException("apply_table: function name cannot be NULL");
+	}
+
+	string func_name = StringValue::Get(func_name_val);
+
+	// Validate function name
+	if (!IsValidIdentifier(func_name)) {
+		throw BinderException("apply_table: invalid function name '%s'", func_name);
+	}
+
+	// Check if it's a table function
+	if (!TableFunctionExists(context, func_name)) {
+		// Check if it's a scalar function to give a better error message
+		if (GetCallableFunctionType(context, func_name) != CatalogType::INVALID) {
+			throw BinderException("apply_table: '%s' is a scalar function. Use apply() instead.", func_name);
+		}
+		throw BinderException("apply_table: function '%s' does not exist", func_name);
+	}
+
+	// Build the SQL query: SELECT * FROM func_name(arg1, arg2, ...)
+	string sql = "SELECT * FROM " + func_name + "(";
+	for (idx_t i = 1; i < input.inputs.size(); i++) {
+		if (i > 1) {
+			sql += ", ";
+		}
+		sql += ValueToSQL(input.inputs[i]);
+	}
+	sql += ")";
+
+	// Add named parameters if any
+	if (!input.named_parameters.empty()) {
+		// Named parameters need to be added after regular arguments
+		bool first_named = input.inputs.size() <= 1;
+		for (auto &kv : input.named_parameters) {
+			if (!first_named || input.inputs.size() > 1) {
+				sql = sql.substr(0, sql.length() - 1); // Remove closing paren
+				sql += ", ";
+			} else {
+				sql = sql.substr(0, sql.length() - 1); // Remove closing paren
+			}
+			sql += kv.first + " := " + ValueToSQL(kv.second) + ")";
+			first_named = false;
+		}
+	}
+
+	// Parse and return as subquery
+	return ParseSubquery(sql, context.GetParserOptions());
+}
+
+//===--------------------------------------------------------------------===//
+// apply_table_with(func VARCHAR, args LIST, kwargs STRUCT) -> TABLE
+//===--------------------------------------------------------------------===//
+
+// bind_replace for apply_table_with: generates SQL and replaces with subquery
+static unique_ptr<TableRef> ApplyTableWithBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	// First argument is the function name
+	if (input.inputs.empty()) {
+		throw BinderException("apply_table_with requires at least a function name");
+	}
+
+	auto &func_name_val = input.inputs[0];
+	if (func_name_val.IsNull()) {
+		throw BinderException("apply_table_with: function name cannot be NULL");
+	}
+
+	string func_name = StringValue::Get(func_name_val);
+
+	// Validate function name
+	if (!IsValidIdentifier(func_name)) {
+		throw BinderException("apply_table_with: invalid function name '%s'", func_name);
+	}
+
+	// Check if it's a table function
+	if (!TableFunctionExists(context, func_name)) {
+		// Check if it's a scalar function to give a better error message
+		if (GetCallableFunctionType(context, func_name) != CatalogType::INVALID) {
+			throw BinderException("apply_table_with: '%s' is a scalar function. Use apply_with() instead.", func_name);
+		}
+		throw BinderException("apply_table_with: function '%s' does not exist", func_name);
+	}
+
+	// Get args from named parameter or second input
+	Value args_list;
+	Value kwargs_struct;
+
+	// Check named parameters first
+	auto args_it = input.named_parameters.find("args");
+	if (args_it != input.named_parameters.end()) {
+		args_list = args_it->second;
+	} else if (input.inputs.size() > 1) {
+		args_list = input.inputs[1];
+	}
+
+	auto kwargs_it = input.named_parameters.find("kwargs");
+	if (kwargs_it != input.named_parameters.end()) {
+		kwargs_struct = kwargs_it->second;
+	} else if (input.inputs.size() > 2) {
+		kwargs_struct = input.inputs[2];
+	}
+
+	// Build the SQL query: SELECT * FROM func_name(arg1, arg2, ..., kwarg1 := val1, ...)
+	string sql = "SELECT * FROM " + func_name + "(";
+	bool first = true;
+
+	// Add positional args from list
+	if (!args_list.IsNull() && args_list.type().id() == LogicalTypeId::LIST) {
+		auto &list_children = ListValue::GetChildren(args_list);
+		for (auto &child : list_children) {
+			if (!first) {
+				sql += ", ";
+			}
+			sql += ValueToSQL(child);
+			first = false;
+		}
+	}
+
+	// Add kwargs from struct
+	if (!kwargs_struct.IsNull() && kwargs_struct.type().id() == LogicalTypeId::STRUCT) {
+		auto &struct_children = StructValue::GetChildren(kwargs_struct);
+		auto &type = kwargs_struct.type();
+		for (idx_t i = 0; i < struct_children.size(); i++) {
+			if (!first) {
+				sql += ", ";
+			}
+			auto &name = StructType::GetChildName(type, i);
+			sql += name + " := " + ValueToSQL(struct_children[i]);
+			first = false;
+		}
+	}
+
+	sql += ")";
+
+	// Parse and return as subquery
+	return ParseSubquery(sql, context.GetParserOptions());
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register a scalar function
 	auto func_apply_scalar_function = ScalarFunction("func_apply", {LogicalType::VARCHAR}, LogicalType::VARCHAR, FuncApplyScalarFun);
@@ -552,6 +809,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	apply_with_func.varargs = LogicalType::ANY;
 	apply_with_func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(apply_with_func);
+
+	// Register apply_table (table function with variadic args)
+	// Uses bind_replace to generate SQL dynamically
+	TableFunction apply_table_func("apply_table", {LogicalType::VARCHAR}, nullptr, nullptr);
+	apply_table_func.varargs = LogicalType::ANY;
+	apply_table_func.bind_replace = ApplyTableBindReplace;
+	loader.RegisterFunction(apply_table_func);
+
+	// Register apply_table_with (structured table function with args list and kwargs struct)
+	// Uses bind_replace to generate SQL dynamically
+	TableFunction apply_table_with_func("apply_table_with", {LogicalType::VARCHAR}, nullptr, nullptr);
+	apply_table_with_func.varargs = LogicalType::ANY;
+	apply_table_with_func.named_parameters["args"] = LogicalType::ANY;
+	apply_table_with_func.named_parameters["kwargs"] = LogicalType::ANY;
+	apply_table_with_func.bind_replace = ApplyTableWithBindReplace;
+	loader.RegisterFunction(apply_table_with_func);
 }
 
 void FuncApplyExtension::Load(ExtensionLoader &loader) {

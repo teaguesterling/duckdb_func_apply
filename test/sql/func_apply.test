@@ -634,3 +634,219 @@ HELLO
 
 statement ok
 DROP TABLE test_apply;
+
+# ============================================
+# apply_table() tests
+# ============================================
+
+# --- Basic table function calls ---
+
+# range() is a built-in table function
+query I
+SELECT * FROM apply_table('range', 5);
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT * FROM apply_table('range', 0, 5);
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT * FROM apply_table('range', 0, 10, 2);
+----
+0
+2
+4
+6
+8
+
+# generate_series (similar to range but inclusive)
+query I
+SELECT * FROM apply_table('generate_series', 1, 5);
+----
+1
+2
+3
+4
+5
+
+# --- NULL handling ---
+
+statement error
+SELECT * FROM apply_table(NULL, 5);
+----
+function name cannot be NULL
+
+# --- Error cases ---
+
+statement error
+SELECT * FROM apply_table('not_a_table_function', 1);
+----
+does not exist
+
+statement error
+SELECT * FROM apply_table('', 5);
+----
+invalid function name
+
+statement error
+SELECT * FROM apply_table('123bad', 5);
+----
+invalid function name
+
+# Scalar functions are not table functions
+statement error
+SELECT * FROM apply_table('upper', 'hello');
+----
+is a scalar function
+
+# --- Use in subquery ---
+
+query I
+SELECT count(*) FROM apply_table('range', 10);
+----
+10
+
+query I
+SELECT sum(range) FROM apply_table('range', 1, 6);
+----
+15
+
+# --- Use with aggregate ---
+
+query I
+SELECT max(range) FROM apply_table('range', 100);
+----
+99
+
+# --- Use with filter ---
+
+query I
+SELECT * FROM apply_table('range', 10) WHERE range > 5;
+----
+6
+7
+8
+9
+
+# --- Join with apply_table ---
+
+query II
+SELECT a.range AS a, b.range AS b
+FROM apply_table('range', 3) AS a
+CROSS JOIN apply_table('range', 2) AS b
+ORDER BY a, b;
+----
+0	0
+0	1
+1	0
+1	1
+2	0
+2	1
+
+# ============================================
+# apply_table_with() tests
+# ============================================
+
+# --- Basic usage with args list ---
+
+query I
+SELECT * FROM apply_table_with('range', args := [5]);
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT * FROM apply_table_with('range', args := [0, 5]);
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT * FROM apply_table_with('range', args := [0, 10, 2]);
+----
+0
+2
+4
+6
+8
+
+# --- NULL handling ---
+
+statement error
+SELECT * FROM apply_table_with(NULL, args := [5]);
+----
+function name cannot be NULL
+
+# --- Empty args ---
+
+# range() with no args returns empty (would error, so skip this test)
+
+# --- Error cases ---
+
+statement error
+SELECT * FROM apply_table_with('not_a_table_function', args := [1]);
+----
+does not exist
+
+statement error
+SELECT * FROM apply_table_with('', args := [5]);
+----
+invalid function name
+
+# Scalar functions are not table functions
+statement error
+SELECT * FROM apply_table_with('upper', args := ['hello']);
+----
+is a scalar function
+
+# --- Use in subquery ---
+
+query I
+SELECT count(*) FROM apply_table_with('range', args := [10]);
+----
+10
+
+# --- Case insensitivity ---
+
+query I
+SELECT * FROM apply_table('RANGE', 3);
+----
+0
+1
+2
+
+query I
+SELECT * FROM apply_table_with('RANGE', args := [3]);
+----
+0
+1
+2
+
+# --- Integration test: dynamic table function dispatch ---
+
+# This pattern allows dispatching to different table functions based on data
+query I
+SELECT sum(r)
+FROM (
+    SELECT range AS r FROM apply_table('range', 5)
+    UNION ALL
+    SELECT generate_series AS r FROM apply_table('generate_series', 1, 5)
+);
+----
+25
