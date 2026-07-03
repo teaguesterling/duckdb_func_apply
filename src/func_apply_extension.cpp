@@ -74,6 +74,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/main/config.hpp"
@@ -445,7 +446,9 @@ static string ValueToSQL(const Value &val) {
 			if (i > 0) {
 				result += ", ";
 			}
-			result += "'" + StructType::GetChildName(type, i) + "': ";
+			// Struct-literal keys are single-quoted string literals. Quote/escape the child
+			// name so a name containing a quote cannot break out of the literal and inject SQL.
+			result += KeywordHelper::WriteQuoted(StructType::GetChildName(type, i), '\'') + ": ";
 			result += ValueToSQL(children[i]);
 		}
 		result += "}";
@@ -475,8 +478,12 @@ static string ValueToSQL(const Value &val) {
 	case LogicalTypeId::INTERVAL:
 		return "'" + val.ToString() + "'::INTERVAL";
 	default:
-		// For other types, try to use as string literal with cast
-		return "'" + StringUtil::Replace(val.ToString(), "'", "''") + "'::" + val.type().ToString();
+		// For any remaining types (e.g. DECIMAL, UUID, ENUM, BIT), delegate to DuckDB's own
+		// canonical value-to-SQL serialization instead of concatenating a raw
+		// val.type().ToString() suffix into the query text. ToSQLString() produces a properly
+		// formed literal/cast for scalar types; this branch is never reached for STRUCT/LIST
+		// (handled above), so its unescaped-struct-key path cannot be hit here.
+		return val.ToSQLString();
 	}
 }
 
@@ -956,7 +963,9 @@ static unique_ptr<TableRef> ApplyTableBindReplace(ClientContext &context, TableF
 			} else {
 				sql = sql.substr(0, sql.length() - 1); // Remove closing paren
 			}
-			sql += kv.first + " := " + ValueToSQL(kv.second) + ")";
+			// Quote/escape the named-parameter identifier so it cannot break out of the
+			// argument list and inject SQL that bypasses the security policy.
+			sql += KeywordHelper::WriteOptionallyQuoted(kv.first) + " := " + ValueToSQL(kv.second) + ")";
 			first_named = false;
 		}
 	}
@@ -1057,8 +1066,11 @@ static unique_ptr<TableRef> ApplyTableWithBindReplace(ClientContext &context, Ta
 			if (!first) {
 				sql += ", ";
 			}
+			// The kwargs struct's field names become named-parameter identifiers in the
+			// generated SQL. Quote/escape them so an attacker-controlled field name cannot
+			// break out of the call and inject SQL that bypasses the security policy.
 			auto &name = StructType::GetChildName(type, i);
-			sql += name + " := " + ValueToSQL(struct_children[i]);
+			sql += KeywordHelper::WriteOptionallyQuoted(name) + " := " + ValueToSQL(struct_children[i]);
 			first = false;
 		}
 	}

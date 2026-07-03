@@ -1,0 +1,58 @@
+# name: test/sql/func_apply_security_injection.test
+# description: regression test for identifier injection bypassing the extension's own whitelist (GHSA-55g5-vp25-phpg)
+# group: [sql]
+
+require func_apply
+
+# Enable whitelist mode allowing ONLY the benign 'range' table function.
+query I
+SELECT func_apply_set_security_mode('whitelist');
+----
+Security mode set to: whitelist
+
+query I
+SELECT func_apply_set_whitelist(['range']);
+----
+Whitelist set with 1 functions
+
+# Control: a non-whitelisted benign function ('length') is genuinely blocked by the policy.
+# This establishes that if 'length' ever executes below, it did so by BYPASSING the whitelist.
+statement error
+SELECT apply('length', 'abcde');
+----
+blocked by func_apply security policy
+
+# Positive: a legitimate whitelisted call still works (no over-blocking of valid identifiers).
+query I
+SELECT * FROM apply_table_with('range', args := [3]);
+----
+0
+1
+2
+
+query I
+SELECT count(*) FROM apply_table('range', 5);
+----
+5
+
+# --- Injection 1: kwargs struct field name -> named-parameter identifier (src :1060) ---
+# The struct field name is concatenated into the reparsed table-function SQL as `name := value`.
+# A crafted field name that references a different, NON-whitelisted benign function ('length')
+# must not execute that function. Pre-fix this returned the value 5 (length executed despite the
+# whitelist); post-fix the field name is quoted as a single identifier and rejected by the binder.
+statement error
+SELECT * FROM apply_table_with('range', kwargs := {'0) UNION ALL SELECT length(''abcde'') --': 0});
+----
+
+# --- Injection 2: positional STRUCT value field name (src :448) ---
+# Struct-literal keys are emitted as single-quoted string literals; an unescaped quote in the
+# field name previously let the crafted text escape the literal. Post-fix the key is quoted/escaped.
+statement error
+SELECT * FROM apply_table('range', {'0) UNION ALL SELECT length(''abcde'') --': 0});
+----
+
+# The whitelist is still in force after the injection attempts: 'length' remains blocked.
+statement error
+SELECT apply('length', 'abcde');
+----
+blocked by func_apply security policy
