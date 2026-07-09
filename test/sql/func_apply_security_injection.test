@@ -4,6 +4,14 @@
 
 require func_apply
 
+# Isolation note: func_apply.test (which runs earlier in the same unittest
+# process) calls func_apply_lock_security(). The security config is per-session
+# state on the ClientContext (registered_state), so this file's fresh
+# connection starts unlocked and the whitelist setup below genuinely executes.
+# If the setup below ever fails with "security settings are locked", per-session
+# config storage has regressed to leaking across sessions -- fix that rather
+# than reordering tests.
+
 # Enable whitelist mode allowing ONLY the benign 'range' table function.
 query I
 SELECT func_apply_set_security_mode('whitelist');
