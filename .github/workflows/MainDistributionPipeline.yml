@@ -24,19 +24,24 @@ jobs:
       ci_tools_version: main
       extension_name: func_apply
 
+  # Stable release build: targets the released, loadable v1.5.4 TAG (not the
+  # v1.5-variegata branch tip). The submodule pointer tracks v1.5-variegata for
+  # tracking purposes, but set_duckdb_version checks the submodule out to this
+  # tag, so CI builds against released DuckDB -- producing an extension that
+  # actually loads in the shipped v1.5.4 runtime. Merge-readiness is judged here.
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
     with:
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
       extension_name: func_apply
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.4
     with:
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
       extension_name: func_apply
       format_checks: 'format;tidy'
