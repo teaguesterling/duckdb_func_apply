@@ -63,6 +63,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -74,6 +75,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/main/config.hpp"
@@ -143,28 +145,31 @@ struct FuncApplySecurityConfig {
 	}
 };
 
-// Global map for per-session security configuration
-// Key: raw pointer to ClientContext (lifetime managed by DuckDB)
-static mutex security_config_mutex;
-static unordered_map<ClientContext *, unique_ptr<FuncApplySecurityConfig>> security_configs;
+// Per-session security configuration, stored on the ClientContext itself via
+// registered_state so its lifetime is exactly the session's lifetime.
+//
+// This was previously a process-global map keyed on the raw ClientContext*,
+// with a cleanup function that was never called. Entries therefore outlived
+// their session, and a later session whose ClientContext happened to be
+// allocated at a recycled address silently inherited the earlier session's
+// config -- including `locked = true` (making the per-session one-way lock
+// accidentally poison unrelated future sessions in the same process) or,
+// worse, an earlier session's relaxed whitelist. Tying the config to the
+// context's registered state removes that aliasing while keeping the intended
+// guarantee: within a session, the lock remains irreversible.
+struct FuncApplySecurityState : public ClientContextState {
+	FuncApplySecurityConfig config;
+};
+
+static constexpr const char *FUNC_APPLY_SECURITY_STATE_KEY = "func_apply_security";
 
 // Get or create security config for a session
 static FuncApplySecurityConfig &GetSecurityConfig(ClientContext &context) {
-	lock_guard<mutex> lock(security_config_mutex);
-	auto it = security_configs.find(&context);
-	if (it == security_configs.end()) {
-		auto config = make_uniq<FuncApplySecurityConfig>();
-		auto &ref = *config;
-		security_configs[&context] = std::move(config);
-		return ref;
-	}
-	return *it->second;
-}
-
-// Clean up security config when session ends (called from destructor or explicitly)
-static void CleanupSecurityConfig(ClientContext &context) {
-	lock_guard<mutex> lock(security_config_mutex);
-	security_configs.erase(&context);
+	// RegisteredStateManager::GetOrCreate is internally synchronized; the
+	// manager keeps the shared_ptr alive for the lifetime of the context, so
+	// returning a reference into it is safe.
+	auto state = context.registered_state->GetOrCreate<FuncApplySecurityState>(FUNC_APPLY_SECURITY_STATE_KEY);
+	return state->config;
 }
 
 // Forward declaration for validator
@@ -445,7 +450,9 @@ static string ValueToSQL(const Value &val) {
 			if (i > 0) {
 				result += ", ";
 			}
-			result += "'" + StructType::GetChildName(type, i) + "': ";
+			// Struct-literal keys are single-quoted string literals. Quote/escape the child
+			// name so a name containing a quote cannot break out of the literal and inject SQL.
+			result += KeywordHelper::WriteQuoted(StructType::GetChildName(type, i), '\'') + ": ";
 			result += ValueToSQL(children[i]);
 		}
 		result += "}";
@@ -475,8 +482,12 @@ static string ValueToSQL(const Value &val) {
 	case LogicalTypeId::INTERVAL:
 		return "'" + val.ToString() + "'::INTERVAL";
 	default:
-		// For other types, try to use as string literal with cast
-		return "'" + StringUtil::Replace(val.ToString(), "'", "''") + "'::" + val.type().ToString();
+		// For any remaining types (e.g. DECIMAL, UUID, ENUM, BIT), delegate to DuckDB's own
+		// canonical value-to-SQL serialization instead of concatenating a raw
+		// val.type().ToString() suffix into the query text. ToSQLString() produces a properly
+		// formed literal/cast for scalar types; this branch is never reached for STRUCT/LIST
+		// (handled above), so its unescaped-struct-key path cannot be hit here.
+		return val.ToSQLString();
 	}
 }
 
@@ -956,7 +967,9 @@ static unique_ptr<TableRef> ApplyTableBindReplace(ClientContext &context, TableF
 			} else {
 				sql = sql.substr(0, sql.length() - 1); // Remove closing paren
 			}
-			sql += kv.first + " := " + ValueToSQL(kv.second) + ")";
+			// Quote/escape the named-parameter identifier so it cannot break out of the
+			// argument list and inject SQL that bypasses the security policy.
+			sql += KeywordHelper::WriteOptionallyQuoted(kv.first) + " := " + ValueToSQL(kv.second) + ")";
 			first_named = false;
 		}
 	}
@@ -1057,8 +1070,11 @@ static unique_ptr<TableRef> ApplyTableWithBindReplace(ClientContext &context, Ta
 			if (!first) {
 				sql += ", ";
 			}
+			// The kwargs struct's field names become named-parameter identifiers in the
+			// generated SQL. Quote/escape them so an attacker-controlled field name cannot
+			// break out of the call and inject SQL that bypasses the security policy.
 			auto &name = StructType::GetChildName(type, i);
-			sql += name + " := " + ValueToSQL(struct_children[i]);
+			sql += KeywordHelper::WriteOptionallyQuoted(name) + " := " + ValueToSQL(struct_children[i]);
 			first = false;
 		}
 	}
