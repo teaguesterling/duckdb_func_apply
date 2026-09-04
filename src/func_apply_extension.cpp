@@ -1324,15 +1324,38 @@ static void GetSecurityConfigScalarFun(DataChunk &args, ExpressionState &state, 
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Every scalar function registered below is marked fallible.
+	//
+	// v2.0 requires a scalar function that can throw at execution time to declare
+	// it; throwing from one that has not becomes an INTERNAL error ("the function
+	// is not marked as fallible - the function must call SetFallible()"). There is
+	// no compile error and nothing in the DuckDB API to grep for, and the check is
+	// an assertion, so it only fires on assertion-enabled builds -- which is why it
+	// shows up as one architecture red and another green.
+	//
+	// Every function here throws: apply/apply_with raise InvalidInputException for
+	// unknown or non-callable functions, for invalid identifiers and for anything
+	// the security policy blocks; the setters raise when the config is locked or
+	// the value is invalid; function_exists and the config reader reach the catalog
+	// and Vector::SetValue, both of which throw. The risk is asymmetric -- marking
+	// a function fallible that never throws costs an optimisation, while the
+	// converse is an internal error at runtime -- so this is applied uniformly.
+	//
+	// SetFallible() exists on both v1.5 and v2.0, so it needs no compat shim. It
+	// must be called BEFORE the function is registered: on v2.0 a FunctionSet's
+	// overloads are immutable once added.
+
 	// Register function_exists
 	auto function_exists_func =
 	    ScalarFunction("function_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, FunctionExistsScalarFun);
+	function_exists_func.SetFallible();
 	loader.RegisterFunction(function_exists_func);
 
 	// Register apply (variadic)
 	auto apply_func = ScalarFunction("apply", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyScalarFun, BindApply);
 	CompatSetScalarVarArgs(apply_func, LogicalType::ANY);
 	CompatSetScalarNullHandling(apply_func, FunctionNullHandling::SPECIAL_HANDLING);
+	apply_func.SetFallible();
 	loader.RegisterFunction(apply_func);
 
 	// Register apply_with (structured with named params support)
@@ -1348,6 +1371,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// aliases arrive empty, every named argument is treated as positional, and the
 	// breakage is at runtime with a green build. No-op on v1.5.
 	CompatSetCaptureArgumentAliases(apply_with_func);
+	apply_with_func.SetFallible();
 	loader.RegisterFunction(apply_with_func);
 
 	// Register apply_table (table function with variadic args)
@@ -1373,41 +1397,49 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// func_apply_set_security_mode(mode VARCHAR) -> VARCHAR
 	auto set_security_mode_func = ScalarFunction("func_apply_set_security_mode", {LogicalType::VARCHAR},
 	                                             LogicalType::VARCHAR, SetSecurityModeScalarFun);
+	set_security_mode_func.SetFallible();
 	loader.RegisterFunction(set_security_mode_func);
 
 	// func_apply_set_blacklist(list LIST) -> VARCHAR
 	auto set_blacklist_func = ScalarFunction("func_apply_set_blacklist", {LogicalType::LIST(LogicalType::VARCHAR)},
 	                                         LogicalType::VARCHAR, SetBlacklistScalarFun);
+	set_blacklist_func.SetFallible();
 	loader.RegisterFunction(set_blacklist_func);
 
 	// func_apply_set_whitelist(list LIST) -> VARCHAR
 	auto set_whitelist_func = ScalarFunction("func_apply_set_whitelist", {LogicalType::LIST(LogicalType::VARCHAR)},
 	                                         LogicalType::VARCHAR, SetWhitelistScalarFun);
+	set_whitelist_func.SetFallible();
 	loader.RegisterFunction(set_whitelist_func);
 
 	// func_apply_set_validator(func_name VARCHAR) -> VARCHAR
 	auto set_validator_func =
 	    ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetValidatorScalarFun);
+	set_validator_func.SetFallible();
 	loader.RegisterFunction(set_validator_func);
 
 	// func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
 	auto set_on_block_func =
 	    ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetOnBlockScalarFun);
+	set_on_block_func.SetFallible();
 	loader.RegisterFunction(set_on_block_func);
 
 	// func_apply_set_block_default(value ANY) -> VARCHAR
 	auto set_block_default_func = ScalarFunction("func_apply_set_block_default", {LogicalType::ANY},
 	                                             LogicalType::VARCHAR, SetBlockDefaultScalarFun);
+	set_block_default_func.SetFallible();
 	loader.RegisterFunction(set_block_default_func);
 
 	// func_apply_lock_security() -> VARCHAR
 	auto lock_security_func =
 	    ScalarFunction("func_apply_lock_security", {}, LogicalType::VARCHAR, LockSecurityScalarFun);
+	lock_security_func.SetFallible();
 	loader.RegisterFunction(lock_security_func);
 
 	// func_apply_get_security_config() -> VARCHAR
 	auto get_security_config_func =
 	    ScalarFunction("func_apply_get_security_config", {}, LogicalType::VARCHAR, GetSecurityConfigScalarFun);
+	get_security_config_func.SetFallible();
 	loader.RegisterFunction(get_security_config_func);
 }
 
