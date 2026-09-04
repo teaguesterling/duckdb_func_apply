@@ -52,9 +52,20 @@
 // so only the places a *runtime* string crosses the boundary need a helper, and
 // string literals such as DEFAULT_SCHEMA keep compiling untouched.
 //
-// Probed separately from probe 1 on purpose: tying two independent changes to
-// one macro silently picks the wrong branch if they ever land in different
-// releases.
+// The macro below says only "the Identifier TYPE is reachable" -- it must NOT be
+// used to decide whether the name-typed APIs actually take one. identifier.hpp
+// was backported to the stable line WITHOUT the signature changes, so all three
+// of these are real, live configurations:
+//
+//   v1.5-variegata @ b155d6f (our pin)  no identifier.hpp   child_list_t key: string
+//   v1.5-variegata @ branch tip         HAS identifier.hpp  child_list_t key: string
+//   main (v2.0)                         HAS identifier.hpp  child_list_t key: Identifier
+//
+// So a __has_include probe driving CompatMakeName would flip to Identifier on
+// the next submodule bump, against a DuckDB whose catalog and binder still want
+// strings -- a build break with no source change. CompatName is therefore
+// derived from the API's OWN shape below, and this macro only gates the extra
+// CompatNameStr overload, which is harmless wherever the type exists.
 #if __has_include("duckdb/common/identifier.hpp")
 #define DUCKDB_HAS_IDENTIFIER 1
 #include "duckdb/common/identifier.hpp"
@@ -73,24 +84,32 @@ namespace duckdb {
 // Identifier boundary helpers
 //===--------------------------------------------------------------------===//
 
+//! The name type the DuckDB in use actually wants, read off the API itself
+//! rather than inferred from a header's presence: `string` on v1.5 (pin and
+//! branch tip alike), `Identifier` on v2.0. child_list_t is the right witness
+//! because its key moved in lockstep with every other name-typed boundary this
+//! extension crosses -- catalog lookups, FunctionBinder::BindScalarFunction, the
+//! FunctionExpression constructor and named_parameter_map_t keys.
+using CompatName = typename child_list_t<int>::value_type::first_type;
+
+//! Promote a RUNTIME string to whatever the current name type is. Constructing
+//! an Identifier from a string is explicit upstream by design, and that
+//! deliberateness is preserved here: this is a no-op on v1.5 and an explicit
+//! promotion on v2.0. String literals need none of this -- Identifier's
+//! const char * constructor is implicit -- so DEFAULT_SCHEMA and friends stay
+//! untouched at every call site.
+inline CompatName CompatMakeName(string name) {
+	return CompatName(std::move(name));
+}
+
+//! Read a name back out as a plain string, for the APIs that still take one
+//! (KeywordHelper, StringUtil, comparisons against string literals).
+inline const string &CompatNameStr(const string &name) {
+	return name;
+}
 #ifdef DUCKDB_HAS_IDENTIFIER
-using CompatName = Identifier;
 inline const string &CompatNameStr(const Identifier &id) {
 	return id.GetIdentifierName();
-}
-inline const string &CompatNameStr(const string &name) {
-	return name;
-}
-inline Identifier CompatMakeName(string name) {
-	return Identifier(std::move(name));
-}
-#else
-using CompatName = string;
-inline const string &CompatNameStr(const string &name) {
-	return name;
-}
-inline string CompatMakeName(string name) {
-	return name;
 }
 #endif
 
