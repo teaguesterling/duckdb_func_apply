@@ -203,9 +203,11 @@ static bool CallValidator(ClientContext &context, const string &validator_name, 
 		pos_indexes.push_back(Value(idx));
 		pos_types.push_back(Value(positional_args[i].type().ToString()));
 		// child_list_t<Value> keys are duckdb::Identifier on v2.0. `idx` is a runtime
-		// string, so promoting it is explicit by design -- CompatMakeName is a no-op
-		// on v1.5, where the key type is still std::string.
-		pos_values.push_back(make_pair(CompatMakeName(idx), positional_args[i]));
+		// string, so promoting it is explicit by design -- CompatMakeIdentifierKey is
+		// a no-op on v1.5, where the key type is still std::string. Note this is the
+		// STRUCT-key helper, not the bind-name one: the two are derived from separate
+		// upstream declarations precisely so they can diverge without breaking here.
+		pos_values.push_back(make_pair(CompatMakeIdentifierKey(idx), positional_args[i]));
 	}
 
 	Value positional_struct;
@@ -233,7 +235,7 @@ static bool CallValidator(ClientContext &context, const string &validator_name, 
 	for (auto &kv : named_args) {
 		named_names.push_back(Value(kv.first));
 		named_types.push_back(Value(kv.second.type().ToString()));
-		named_values.push_back(make_pair(CompatMakeName(kv.first), kv.second));
+		named_values.push_back(make_pair(CompatMakeIdentifierKey(kv.first), kv.second));
 	}
 
 	Value named_struct;
