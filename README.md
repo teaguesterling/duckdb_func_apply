@@ -116,13 +116,19 @@ Calls a table function with arguments provided as a list and optional named para
 SELECT * FROM apply_table_with('range', args := [5]);
 -- Returns: 0, 1, 2, 3, 4
 
--- With named parameters
-SELECT * FROM apply_table_with('generate_series',
-    args := [1],
-    kwargs := {stop: 10, step: 2}
-);
+-- Positional arguments go in `args`, in order
+SELECT * FROM apply_table_with('generate_series', args := [1, 10, 2]);
 -- Returns: 1, 3, 5, 7, 9
+
+-- `kwargs` is for the target function's NAMED parameters
+SELECT * FROM apply_table_with('repeat_row', args := [42], kwargs := {num_rows: 3});
+-- Returns: 42, 42, 42
 ```
+
+**`kwargs` is not a second way to pass positional arguments.** Each key must be
+a named parameter the target table function actually declares, or the bind
+fails (`Invalid named parameter "step" for function generate_series`). Check
+`duckdb_functions()` if you are unsure which parameters a function names.
 
 ### `function_exists(name)`
 
@@ -163,6 +169,10 @@ result if you need a specific type:
 -- func_name comes from a column -> result is VARCHAR
 SELECT apply(t.func_name, t.value)::INTEGER FROM t;
 ```
+
+`VARCHAR` is also the fallback whenever the bind-time lookup cannot complete for
+a constant name — an unrecognised name, or one whose arguments do not resolve to
+an overload at bind time. `typeof()` will tell you which type you actually got.
 
 ## Security Model
 
