@@ -53,6 +53,7 @@
 
 #include "func_apply_extension.hpp"
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -201,7 +202,12 @@ static bool CallValidator(ClientContext &context, const string &validator_name, 
 		string idx = to_string(i + 1);
 		pos_indexes.push_back(Value(idx));
 		pos_types.push_back(Value(positional_args[i].type().ToString()));
-		pos_values.push_back(make_pair(idx, positional_args[i]));
+		// child_list_t<Value> keys are duckdb::Identifier on v2.0. `idx` is a runtime
+		// string, so promoting it is explicit by design -- CompatMakeIdentifierKey is
+		// a no-op on v1.5, where the key type is still std::string. Note this is the
+		// STRUCT-key helper, not the bind-name one: the two are derived from separate
+		// upstream declarations precisely so they can diverge without breaking here.
+		pos_values.push_back(make_pair(CompatMakeIdentifierKey(idx), positional_args[i]));
 	}
 
 	Value positional_struct;
@@ -229,7 +235,7 @@ static bool CallValidator(ClientContext &context, const string &validator_name, 
 	for (auto &kv : named_args) {
 		named_names.push_back(Value(kv.first));
 		named_types.push_back(Value(kv.second.type().ToString()));
-		named_values.push_back(make_pair(kv.first, kv.second));
+		named_values.push_back(make_pair(CompatMakeIdentifierKey(kv.first), kv.second));
 	}
 
 	Value named_struct;
@@ -333,7 +339,11 @@ static Value GetBlockedValue(ClientContext &context) {
 static bool CheckFunctionExistsInCatalog(ClientContext &context, Catalog &catalog, const string &func_name,
                                          const vector<CatalogType> &types) {
 	for (auto type : types) {
-		auto entry = catalog.GetEntry(context, type, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
+		// Catalog::GetEntry takes Identifier schema/name on v2.0. DEFAULT_SCHEMA is a
+		// string literal (implicitly an Identifier); func_name is a runtime string and
+		// must be promoted explicitly.
+		auto entry =
+		    catalog.GetEntry(context, type, DEFAULT_SCHEMA, CompatMakeName(func_name), OnEntryNotFound::RETURN_NULL);
 		if (entry) {
 			return true;
 		}
@@ -452,7 +462,7 @@ static string ValueToSQL(const Value &val) {
 			}
 			// Struct-literal keys are single-quoted string literals. Quote/escape the child
 			// name so a name containing a quote cannot break out of the literal and inject SQL.
-			result += KeywordHelper::WriteQuoted(StructType::GetChildName(type, i), '\'') + ": ";
+			result += KeywordHelper::WriteQuoted(CompatNameStr(StructType::GetChildName(type, i)), '\'') + ": ";
 			result += ValueToSQL(children[i]);
 		}
 		result += "}";
@@ -505,7 +515,8 @@ static string ValueToSQL(const Value &val) {
 static bool FunctionExistsOfType(ClientContext &context, const string &func_name, CatalogType type) {
 	// First check system catalog (built-in functions)
 	auto &system_catalog = Catalog::GetSystemCatalog(context);
-	auto entry = system_catalog.GetEntry(context, type, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
+	auto entry =
+	    system_catalog.GetEntry(context, type, DEFAULT_SCHEMA, CompatMakeName(func_name), OnEntryNotFound::RETURN_NULL);
 
 	if (entry && entry->type == type) {
 		return true;
@@ -517,8 +528,8 @@ static bool FunctionExistsOfType(ClientContext &context, const string &func_name
 	if (!default_db_name.empty()) {
 		auto catalog_entry = Catalog::GetCatalogEntry(context, default_db_name);
 		if (catalog_entry) {
-			auto user_entry =
-			    catalog_entry->GetEntry(context, type, DEFAULT_SCHEMA, func_name, OnEntryNotFound::RETURN_NULL);
+			auto user_entry = catalog_entry->GetEntry(context, type, DEFAULT_SCHEMA, CompatMakeName(func_name),
+			                                          OnEntryNotFound::RETURN_NULL);
 			if (user_entry && user_entry->type == type) {
 				return true;
 			}
@@ -591,7 +602,8 @@ static Value ExecuteFunctionInternal(ClientContext &context, const string &func_
 
 		ErrorData error;
 		FunctionBinder binder(context);
-		auto bound_expr = binder.BindScalarFunction(DEFAULT_SCHEMA, func_name, std::move(arg_exprs), error);
+		auto bound_expr =
+		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(arg_exprs), error);
 
 		if (error.HasError()) {
 			throw InvalidInputException("Function '%s': %s", func_name, error.Message());
@@ -613,7 +625,8 @@ static Value ExecuteFunctionInternal(ClientContext &context, const string &func_
 			parsed_args.push_back(make_uniq<ConstantExpression>(arg));
 		}
 
-		unique_ptr<ParsedExpression> func_expr = make_uniq<FunctionExpression>(func_name, std::move(parsed_args));
+		unique_ptr<ParsedExpression> func_expr =
+		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
 
 		// Create a binder and use ConstantBinder to bind the expression
 		// ConstantBinder is designed for binding expressions in a constant context
@@ -638,10 +651,16 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 // apply(func VARCHAR, ...args ANY) -> ANY
 //===--------------------------------------------------------------------===//
 
-static unique_ptr<FunctionData> BindApply(ClientContext &context, ScalarFunction &bound_function,
-                                          vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
+#ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
+	// v2.0 collapsed the three bind parameters into a single input object. Unpack
+	// them here so the rest of the body is identical on both versions.
+	auto &context = bind_input.GetClientContext();
+	auto &arguments = bind_input.GetArguments();
+	auto &bound_function = bind_input.GetBoundFunction();
+#endif
 	// Default return type
-	bound_function.return_type = LogicalType::VARCHAR;
+	CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
 
 	// If no arguments beyond function name, nothing to infer
 	if (arguments.empty()) {
@@ -678,13 +697,14 @@ static unique_ptr<FunctionData> BindApply(ClientContext &context, ScalarFunction
 
 		ErrorData error;
 		FunctionBinder binder(context);
-		auto bound_expr = binder.BindScalarFunction(DEFAULT_SCHEMA, func_name, std::move(target_args), error);
+		auto bound_expr =
+		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(target_args), error);
 
 		if (error.HasError() || !bound_expr) {
 			return nullptr;
 		}
 
-		bound_function.return_type = bound_expr->return_type;
+		CompatBindSetReturnType(bound_function, CompatExprReturnType(*bound_expr));
 		return nullptr;
 	}
 
@@ -699,17 +719,18 @@ static unique_ptr<FunctionData> BindApply(ClientContext &context, ScalarFunction
 			} else {
 				// For non-constant expressions, we need to use the expression's type
 				// Create a constant with a dummy value of the right type
-				parsed_args.push_back(make_uniq<ConstantExpression>(Value(arguments[i]->return_type)));
+				parsed_args.push_back(make_uniq<ConstantExpression>(Value(CompatExprReturnType(*arguments[i]))));
 			}
 		}
 
-		unique_ptr<ParsedExpression> func_expr = make_uniq<FunctionExpression>(func_name, std::move(parsed_args));
+		unique_ptr<ParsedExpression> func_expr =
+		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
 
 		try {
 			auto binder = Binder::CreateBinder(context);
 			ConstantBinder constant_binder(*binder, context, "apply");
 			auto bound_expr = constant_binder.Bind(func_expr);
-			bound_function.return_type = bound_expr->return_type;
+			CompatBindSetReturnType(bound_function, CompatExprReturnType(*bound_expr));
 		} catch (...) {
 			// If binding fails, fall back to VARCHAR
 			return nullptr;
@@ -780,10 +801,14 @@ struct ApplyWithBindData : public FunctionData {
 	}
 };
 
-static unique_ptr<FunctionData> BindApplyWith(ClientContext &context, ScalarFunction &bound_function,
-                                              vector<unique_ptr<Expression>> &arguments) {
+static unique_ptr<FunctionData> BindApplyWith(DUCKDB_SCALAR_BIND_PARAMS) {
+#ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
+	auto &context = bind_input.GetClientContext();
+	auto &arguments = bind_input.GetArguments();
+	auto &bound_function = bind_input.GetBoundFunction();
+#endif
 	auto bind_data = make_uniq<ApplyWithBindData>();
-	bound_function.return_type = LogicalType::VARCHAR;
+	CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
 
 	if (arguments.empty()) {
 		throw InvalidInputException("apply_with requires at least a function name");
@@ -791,8 +816,13 @@ static unique_ptr<FunctionData> BindApplyWith(ClientContext &context, ScalarFunc
 
 	// First argument is always the function name
 	// Remaining arguments can be positional (args, kwargs) or named (args := ..., kwargs := ...)
+	// The alias is how `apply_with(f, args := [...], kwargs := {...})` reaches us.
+	// On v2.0 the binder only records argument aliases for functions that opt in
+	// via SetCaptureArgumentAliases(true) -- see LoadInternal, where apply_with
+	// does exactly that. Without it these come back empty and every named
+	// argument silently degrades to positional.
 	for (idx_t i = 1; i < arguments.size(); i++) {
-		auto &alias = arguments[i]->alias;
+		auto &alias = CompatExprAlias(*arguments[i]);
 		if (alias == "args") {
 			bind_data->args_idx = i;
 		} else if (alias == "kwargs") {
@@ -817,12 +847,16 @@ static unique_ptr<FunctionData> BindApplyWith(ClientContext &context, ScalarFunc
 				auto func_type = GetCallableFunctionType(context, func_name);
 				if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 					auto &catalog = Catalog::GetSystemCatalog(context);
-					auto func_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(context, DEFAULT_SCHEMA, func_name,
-					                                                               OnEntryNotFound::RETURN_NULL);
+					auto func_entry = catalog.GetEntry<ScalarFunctionCatalogEntry>(
+					    context, DEFAULT_SCHEMA, CompatMakeName(func_name), OnEntryNotFound::RETURN_NULL);
 					if (func_entry && !func_entry->functions.functions.empty()) {
-						auto &first_func = func_entry->functions.functions[0];
-						if (first_func.return_type.id() != LogicalTypeId::ANY) {
-							bound_function.return_type = first_func.return_type;
+						// v2.0's FunctionSet holds shared_ptr<const ScalarFunction> rather than
+						// ScalarFunction, because overloads are immutable once bound from.
+						// CompatFunctionRef absorbs the extra dereference; the accessor
+						// GetReturnType() exists on both versions.
+						auto &first_func = CompatFunctionRef(func_entry->functions.functions[0]);
+						if (first_func.GetReturnType().id() != LogicalTypeId::ANY) {
+							CompatBindSetReturnType(bound_function, first_func.GetReturnType());
 						}
 					}
 				}
@@ -835,7 +869,7 @@ static unique_ptr<FunctionData> BindApplyWith(ClientContext &context, ScalarFunc
 
 static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
-	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info->Cast<ApplyWithBindData>();
+	auto &bind_data = CompatBoundBindInfo(state.expr.Cast<BoundFunctionExpression>())->Cast<ApplyWithBindData>();
 	idx_t count = args.size();
 
 	for (idx_t i = 0; i < count; i++) {
@@ -969,7 +1003,8 @@ static unique_ptr<TableRef> ApplyTableBindReplace(ClientContext &context, TableF
 			}
 			// Quote/escape the named-parameter identifier so it cannot break out of the
 			// argument list and inject SQL that bypasses the security policy.
-			sql += KeywordHelper::WriteOptionallyQuoted(kv.first) + " := " + ValueToSQL(kv.second) + ")";
+			// named_parameter_map_t is keyed by Identifier on v2.0.
+			sql += KeywordHelper::WriteOptionallyQuoted(CompatNameStr(kv.first)) + " := " + ValueToSQL(kv.second) + ")";
 			first_named = false;
 		}
 	}
@@ -1074,7 +1109,7 @@ static unique_ptr<TableRef> ApplyTableWithBindReplace(ClientContext &context, Ta
 			// generated SQL. Quote/escape them so an attacker-controlled field name cannot
 			// break out of the call and inject SQL that bypasses the security policy.
 			auto &name = StructType::GetChildName(type, i);
-			sql += KeywordHelper::WriteOptionallyQuoted(name) + " := " + ValueToSQL(struct_children[i]);
+			sql += KeywordHelper::WriteOptionallyQuoted(CompatNameStr(name)) + " := " + ValueToSQL(struct_children[i]);
 			first = false;
 		}
 	}
@@ -1291,15 +1326,38 @@ static void GetSecurityConfigScalarFun(DataChunk &args, ExpressionState &state, 
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Every scalar function registered below is marked fallible.
+	//
+	// v2.0 requires a scalar function that can throw at execution time to declare
+	// it; throwing from one that has not becomes an INTERNAL error ("the function
+	// is not marked as fallible - the function must call SetFallible()"). There is
+	// no compile error and nothing in the DuckDB API to grep for, and the check is
+	// an assertion, so it only fires on assertion-enabled builds -- which is why it
+	// shows up as one architecture red and another green.
+	//
+	// Every function here throws: apply/apply_with raise InvalidInputException for
+	// unknown or non-callable functions, for invalid identifiers and for anything
+	// the security policy blocks; the setters raise when the config is locked or
+	// the value is invalid; function_exists and the config reader reach the catalog
+	// and Vector::SetValue, both of which throw. The risk is asymmetric -- marking
+	// a function fallible that never throws costs an optimisation, while the
+	// converse is an internal error at runtime -- so this is applied uniformly.
+	//
+	// SetFallible() exists on both v1.5 and v2.0, so it needs no compat shim. It
+	// must be called BEFORE the function is registered: on v2.0 a FunctionSet's
+	// overloads are immutable once added.
+
 	// Register function_exists
 	auto function_exists_func =
 	    ScalarFunction("function_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, FunctionExistsScalarFun);
+	function_exists_func.SetFallible();
 	loader.RegisterFunction(function_exists_func);
 
 	// Register apply (variadic)
 	auto apply_func = ScalarFunction("apply", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyScalarFun, BindApply);
-	apply_func.varargs = LogicalType::ANY;
-	apply_func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	CompatSetScalarVarArgs(apply_func, LogicalType::ANY);
+	CompatSetScalarNullHandling(apply_func, FunctionNullHandling::SPECIAL_HANDLING);
+	apply_func.SetFallible();
 	loader.RegisterFunction(apply_func);
 
 	// Register apply_with (structured with named params support)
@@ -1307,8 +1365,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// or named: apply_with(func, args := [...], kwargs := {...})
 	auto apply_with_func =
 	    ScalarFunction("apply_with", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyWithScalarFun, BindApplyWith);
-	apply_with_func.varargs = LogicalType::ANY;
-	apply_with_func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	CompatSetScalarVarArgs(apply_with_func, LogicalType::ANY);
+	CompatSetScalarNullHandling(apply_with_func, FunctionNullHandling::SPECIAL_HANDLING);
+	// apply_with derives which varargs slot is `args` and which is `kwargs` from the
+	// argument aliases (`apply_with('upper', args := ['x'])`). v1.5 recorded those
+	// unconditionally; v2.0 made it opt-in and defaults it OFF, so without this the
+	// aliases arrive empty, every named argument is treated as positional, and the
+	// breakage is at runtime with a green build. No-op on v1.5.
+	CompatSetCaptureArgumentAliases(apply_with_func);
+	apply_with_func.SetFallible();
 	loader.RegisterFunction(apply_with_func);
 
 	// Register apply_table (table function with variadic args)
@@ -1334,41 +1399,49 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// func_apply_set_security_mode(mode VARCHAR) -> VARCHAR
 	auto set_security_mode_func = ScalarFunction("func_apply_set_security_mode", {LogicalType::VARCHAR},
 	                                             LogicalType::VARCHAR, SetSecurityModeScalarFun);
+	set_security_mode_func.SetFallible();
 	loader.RegisterFunction(set_security_mode_func);
 
 	// func_apply_set_blacklist(list LIST) -> VARCHAR
 	auto set_blacklist_func = ScalarFunction("func_apply_set_blacklist", {LogicalType::LIST(LogicalType::VARCHAR)},
 	                                         LogicalType::VARCHAR, SetBlacklistScalarFun);
+	set_blacklist_func.SetFallible();
 	loader.RegisterFunction(set_blacklist_func);
 
 	// func_apply_set_whitelist(list LIST) -> VARCHAR
 	auto set_whitelist_func = ScalarFunction("func_apply_set_whitelist", {LogicalType::LIST(LogicalType::VARCHAR)},
 	                                         LogicalType::VARCHAR, SetWhitelistScalarFun);
+	set_whitelist_func.SetFallible();
 	loader.RegisterFunction(set_whitelist_func);
 
 	// func_apply_set_validator(func_name VARCHAR) -> VARCHAR
 	auto set_validator_func =
 	    ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetValidatorScalarFun);
+	set_validator_func.SetFallible();
 	loader.RegisterFunction(set_validator_func);
 
 	// func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
 	auto set_on_block_func =
 	    ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetOnBlockScalarFun);
+	set_on_block_func.SetFallible();
 	loader.RegisterFunction(set_on_block_func);
 
 	// func_apply_set_block_default(value ANY) -> VARCHAR
 	auto set_block_default_func = ScalarFunction("func_apply_set_block_default", {LogicalType::ANY},
 	                                             LogicalType::VARCHAR, SetBlockDefaultScalarFun);
+	set_block_default_func.SetFallible();
 	loader.RegisterFunction(set_block_default_func);
 
 	// func_apply_lock_security() -> VARCHAR
 	auto lock_security_func =
 	    ScalarFunction("func_apply_lock_security", {}, LogicalType::VARCHAR, LockSecurityScalarFun);
+	lock_security_func.SetFallible();
 	loader.RegisterFunction(lock_security_func);
 
 	// func_apply_get_security_config() -> VARCHAR
 	auto get_security_config_func =
 	    ScalarFunction("func_apply_get_security_config", {}, LogicalType::VARCHAR, GetSecurityConfigScalarFun);
+	get_security_config_func.SetFallible();
 	loader.RegisterFunction(get_security_config_func);
 }
 

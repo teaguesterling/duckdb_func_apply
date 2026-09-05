@@ -8,7 +8,18 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  # github.event_name is part of the key ON PURPOSE. Without it a push to a
+  # branch and a workflow_dispatch on that same branch collide: same ref, same
+  # sha, and both carry an EMPTY head_ref/base_ref, so every other term in this
+  # key is identical. cancel-in-progress then kills the push run the moment the
+  # canary is dispatched by hand -- and a cancelled run reads as a FAILED check
+  # on the PR dashboard, indistinguishable from a real build break.
+  #
+  # This is what produced the five red checks on PR #7 (run 33837528273: Generate
+  # matrix, Linux, MacOS, Windows and DuckDB-Wasm all `cancelled`) while the same
+  # commit built green under both pull_request and workflow_dispatch. Nothing was
+  # wrong with the code; the workflow was cancelling itself.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
 jobs:
