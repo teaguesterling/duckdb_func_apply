@@ -770,6 +770,34 @@ SELECT * FROM apply_table_with('range', args := [0, 10, 2]);
 6
 8
 
+# --- kwargs: the target function's NAMED parameters ---
+# These two cover the README's apply_table_with examples. kwargs is NOT a second
+# way to pass positional arguments: generate_series takes stop/step positionally,
+# so they belong in args, while repeat_row genuinely names `num_rows`.
+
+query I
+SELECT * FROM apply_table_with('generate_series', args := [1, 10, 2]);
+----
+1
+3
+5
+7
+9
+
+query I
+SELECT * FROM apply_table_with('repeat_row', args := [42], kwargs := {num_rows: 3});
+----
+42
+42
+42
+
+# A key that is not a declared named parameter of the target must fail the bind
+# rather than being silently reinterpreted as a positional argument.
+statement error
+SELECT * FROM apply_table_with('generate_series', args := [1], kwargs := {stop: 10, step: 2});
+----
+Invalid named parameter
+
 # --- NULL handling ---
 
 statement error

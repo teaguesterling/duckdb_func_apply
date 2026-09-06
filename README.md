@@ -78,6 +78,12 @@ SELECT apply_with('concat', ['a', 'b', 'c'], NULL);
 
 **Note:** DuckDB lists must be homogeneous (same type). For mixed-type arguments, use `apply()` directly.
 
+**`kwargs` is not yet implemented for `apply_with`.** The parameter is accepted
+for forward compatibility, but passing a non-empty struct raises
+`kwargs (named parameters) are not yet supported`. Use `apply()` with named
+arguments (`apply('substr', s, start := 7, length := 5)`) for scalar named
+parameters. (`apply_table_with` *does* support `kwargs` — see below.)
+
 ### `apply_table(func_name, ...args)`
 
 Calls a table function by name and returns its results as a table.
@@ -110,13 +116,19 @@ Calls a table function with arguments provided as a list and optional named para
 SELECT * FROM apply_table_with('range', args := [5]);
 -- Returns: 0, 1, 2, 3, 4
 
--- With named parameters
-SELECT * FROM apply_table_with('generate_series',
-    args := [1],
-    kwargs := {stop: 10, step: 2}
-);
+-- Positional arguments go in `args`, in order
+SELECT * FROM apply_table_with('generate_series', args := [1, 10, 2]);
 -- Returns: 1, 3, 5, 7, 9
+
+-- `kwargs` is for the target function's NAMED parameters
+SELECT * FROM apply_table_with('repeat_row', args := [42], kwargs := {num_rows: 3});
+-- Returns: 42, 42, 42
 ```
+
+**`kwargs` is not a second way to pass positional arguments.** Each key must be
+a named parameter the target table function actually declares, or the bind
+fails (`Invalid named parameter "step" for function generate_series`). Check
+`duckdb_functions()` if you are unsure which parameters a function names.
 
 ### `function_exists(name)`
 
@@ -142,6 +154,64 @@ FROM my_table;
 | Macros | Yes | `apply`, `apply_with` | `list_sum`, `list_reverse` |
 | Table functions | Yes | `apply_table`, `apply_table_with` | `range`, `generate_series` |
 | Aggregate functions | No | N/A | `sum`, `avg` |
+
+## Return Types
+
+For a **constant** function name, the bind step looks up the target function and
+gives the result column its real type (e.g. `apply('abs', -3)` is `INTEGER`).
+
+For a **dynamic** function name (a column or expression that can't be resolved
+at bind time), the result type cannot be known ahead of execution, so the
+column is typed `VARCHAR` and non-string results are stringified. Cast the
+result if you need a specific type:
+
+```sql
+-- func_name comes from a column -> result is VARCHAR
+SELECT apply(t.func_name, t.value)::INTEGER FROM t;
+```
+
+`VARCHAR` is also the fallback whenever the bind-time lookup cannot complete for
+a constant name — an unrecognised name, or one whose arguments do not resolve to
+an overload at bind time. `typeof()` will tell you which type you actually got.
+
+## Security Model
+
+`apply` and `apply_table` run on the **caller's own context** — they add no
+privilege beyond the SQL the caller could already execute directly. They are a
+dynamic-dispatch convenience, **not a sandbox**.
+
+For scenarios that embed func_apply and want to restrict which functions can be
+invoked (e.g. a function name derived from less-trusted input), an optional,
+opt-in policy is available. It is **per session** and defaults to `none`:
+
+| Function | Description |
+|----------|-------------|
+| `func_apply_set_security_mode(mode)` | `'none'`, `'blacklist'`, `'whitelist'`, or `'validator'` |
+| `func_apply_set_whitelist([...])` / `func_apply_set_blacklist([...])` | Set allowed / denied function names |
+| `func_apply_set_validator(func_name)` | Name of the function consulted in `'validator'` mode |
+| `func_apply_set_on_block(behavior)` | What a blocked call does: `'error'` (default), `'null'`, or `'default'` |
+| `func_apply_set_block_default(value)` | Value returned when `on_block = 'default'` |
+| `func_apply_get_security_config()` | Read back the session's current policy |
+| `func_apply_lock_security()` | Irreversibly lock the current session's policy |
+
+`'blacklist'` mode starts from a built-in deny list (`load`, `install`,
+`uninstall`, `force_install`, `system`, `getenv`, `export_database`,
+`import_database`, `create_secret`, `drop_secret`), which
+`func_apply_set_blacklist` replaces wholesale. That list is inert under the
+default `mode = 'none'`.
+
+```sql
+-- Only allow 'range' to be invoked dynamically in this session
+SELECT func_apply_set_security_mode('whitelist');
+SELECT func_apply_set_whitelist(['range']);
+SELECT func_apply_lock_security();  -- prevent further changes this session
+```
+
+The policy lives on the session's `ClientContext` and does not leak across
+connections. Versions before **0.2.0** stored it process-globally and could be
+bypassed via identifier injection in `apply_table_with` — see security advisory
+[GHSA-55g5-vp25-phpg](https://github.com/teaguesterling/duckdb_func_apply/security/advisories/GHSA-55g5-vp25-phpg);
+upgrade to 0.2.0+.
 
 ## Use Cases
 
