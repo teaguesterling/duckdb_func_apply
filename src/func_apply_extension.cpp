@@ -69,6 +69,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -1348,101 +1349,229 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// overloads are immutable once added.
 
 	// Register function_exists
-	auto function_exists_func =
-	    ScalarFunction("function_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, FunctionExistsScalarFun);
-	function_exists_func.SetFallible();
-	loader.RegisterFunction(function_exists_func);
+	{
+		auto function_exists_func =
+		    ScalarFunction("function_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, FunctionExistsScalarFun);
+		function_exists_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(function_exists_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"func_name"};
+		desc.description = "Check if a function exists in the catalog.";
+		desc.examples = {"function_exists('upper')"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// Register apply (variadic)
-	auto apply_func = ScalarFunction("apply", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyScalarFun, BindApply);
-	CompatSetScalarVarArgs(apply_func, LogicalType::ANY);
-	CompatSetScalarNullHandling(apply_func, FunctionNullHandling::SPECIAL_HANDLING);
-	apply_func.SetFallible();
-	loader.RegisterFunction(apply_func);
+	{
+		auto apply_func = ScalarFunction("apply", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyScalarFun, BindApply);
+		CompatSetScalarVarArgs(apply_func, LogicalType::ANY);
+		CompatSetScalarNullHandling(apply_func, FunctionNullHandling::SPECIAL_HANDLING);
+		apply_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(apply_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"func_name"};
+		desc.description = "Dynamically invoke a scalar function by name with variable arguments.";
+		desc.examples = {"apply('upper', 'hello')"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// Register apply_with (structured with named params support)
 	// Uses varargs to support: apply_with(func, args) or apply_with(func, args, kwargs)
 	// or named: apply_with(func, args := [...], kwargs := {...})
-	auto apply_with_func =
-	    ScalarFunction("apply_with", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyWithScalarFun, BindApplyWith);
-	CompatSetScalarVarArgs(apply_with_func, LogicalType::ANY);
-	CompatSetScalarNullHandling(apply_with_func, FunctionNullHandling::SPECIAL_HANDLING);
-	// apply_with derives which varargs slot is `args` and which is `kwargs` from the
-	// argument aliases (`apply_with('upper', args := ['x'])`). v1.5 recorded those
-	// unconditionally; v2.0 made it opt-in and defaults it OFF, so without this the
-	// aliases arrive empty, every named argument is treated as positional, and the
-	// breakage is at runtime with a green build. No-op on v1.5.
-	CompatSetCaptureArgumentAliases(apply_with_func);
-	apply_with_func.SetFallible();
-	loader.RegisterFunction(apply_with_func);
+	{
+		auto apply_with_func =
+		    ScalarFunction("apply_with", {LogicalType::VARCHAR}, LogicalType::ANY, ApplyWithScalarFun, BindApplyWith);
+		CompatSetScalarVarArgs(apply_with_func, LogicalType::ANY);
+		CompatSetScalarNullHandling(apply_with_func, FunctionNullHandling::SPECIAL_HANDLING);
+		// apply_with derives which varargs slot is `args` and which is `kwargs` from the
+		// argument aliases (`apply_with('upper', args := ['x'])`). v1.5 recorded those
+		// unconditionally; v2.0 made it opt-in and defaults it OFF, so without this the
+		// aliases arrive empty, every named argument is treated as positional, and the
+		// breakage is at runtime with a green build. No-op on v1.5.
+		CompatSetCaptureArgumentAliases(apply_with_func);
+		apply_with_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(apply_with_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"func_name"};
+		desc.description = "Dynamically invoke a scalar function with a list of positional args and struct of kwargs.";
+		desc.examples = {"apply_with('upper', args := ['hello'])"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// Register apply_table (table function with variadic args)
 	// Uses bind_replace to generate SQL dynamically
-	TableFunction apply_table_func("apply_table", {LogicalType::VARCHAR}, nullptr, nullptr);
-	apply_table_func.varargs = LogicalType::ANY;
-	apply_table_func.bind_replace = ApplyTableBindReplace;
-	loader.RegisterFunction(apply_table_func);
+	{
+		TableFunction apply_table_func("apply_table", {LogicalType::VARCHAR}, nullptr, nullptr);
+		apply_table_func.varargs = LogicalType::ANY;
+		apply_table_func.bind_replace = ApplyTableBindReplace;
+		CreateTableFunctionInfo info(std::move(apply_table_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"func_name"};
+		desc.description = "Dynamically invoke a table function by name with variable arguments.";
+		desc.examples = {"SELECT * FROM apply_table('range', 5)"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// Register apply_table_with (structured table function with args list and kwargs struct)
 	// Uses bind_replace to generate SQL dynamically
-	TableFunction apply_table_with_func("apply_table_with", {LogicalType::VARCHAR}, nullptr, nullptr);
-	apply_table_with_func.varargs = LogicalType::ANY;
-	apply_table_with_func.named_parameters["args"] = LogicalType::ANY;
-	apply_table_with_func.named_parameters["kwargs"] = LogicalType::ANY;
-	apply_table_with_func.bind_replace = ApplyTableWithBindReplace;
-	loader.RegisterFunction(apply_table_with_func);
+	{
+		TableFunction apply_table_with_func("apply_table_with", {LogicalType::VARCHAR}, nullptr, nullptr);
+		apply_table_with_func.varargs = LogicalType::ANY;
+		apply_table_with_func.named_parameters["args"] = LogicalType::ANY;
+		apply_table_with_func.named_parameters["kwargs"] = LogicalType::ANY;
+		apply_table_with_func.bind_replace = ApplyTableWithBindReplace;
+		CreateTableFunctionInfo info(std::move(apply_table_with_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"func_name"};
+		desc.description = "Dynamically invoke a table function with structured args and kwargs.";
+		desc.examples = {"SELECT * FROM apply_table_with('range', args := [5])"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	//===--------------------------------------------------------------------===//
 	// Security Configuration Functions
 	//===--------------------------------------------------------------------===//
 
 	// func_apply_set_security_mode(mode VARCHAR) -> VARCHAR
-	auto set_security_mode_func = ScalarFunction("func_apply_set_security_mode", {LogicalType::VARCHAR},
-	                                             LogicalType::VARCHAR, SetSecurityModeScalarFun);
-	set_security_mode_func.SetFallible();
-	loader.RegisterFunction(set_security_mode_func);
+	{
+		auto set_security_mode_func = ScalarFunction("func_apply_set_security_mode", {LogicalType::VARCHAR},
+		                                             LogicalType::VARCHAR, SetSecurityModeScalarFun);
+		set_security_mode_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(set_security_mode_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"mode"};
+		desc.description = "Set the security mode for dynamic function execution ('permissive', 'whitelist', or 'blacklist').";
+		desc.examples = {"func_apply_set_security_mode('permissive')"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_set_blacklist(list LIST) -> VARCHAR
-	auto set_blacklist_func = ScalarFunction("func_apply_set_blacklist", {LogicalType::LIST(LogicalType::VARCHAR)},
-	                                         LogicalType::VARCHAR, SetBlacklistScalarFun);
-	set_blacklist_func.SetFallible();
-	loader.RegisterFunction(set_blacklist_func);
+	{
+		auto set_blacklist_func = ScalarFunction("func_apply_set_blacklist", {LogicalType::LIST(LogicalType::VARCHAR)},
+		                                         LogicalType::VARCHAR, SetBlacklistScalarFun);
+		set_blacklist_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(set_blacklist_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"list"};
+		desc.description = "Set the list of disallowed functions in blacklist security mode.";
+		desc.examples = {"func_apply_set_blacklist(['system', 'read_csv'])"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_set_whitelist(list LIST) -> VARCHAR
-	auto set_whitelist_func = ScalarFunction("func_apply_set_whitelist", {LogicalType::LIST(LogicalType::VARCHAR)},
-	                                         LogicalType::VARCHAR, SetWhitelistScalarFun);
-	set_whitelist_func.SetFallible();
-	loader.RegisterFunction(set_whitelist_func);
+	{
+		auto set_whitelist_func = ScalarFunction("func_apply_set_whitelist", {LogicalType::LIST(LogicalType::VARCHAR)},
+		                                         LogicalType::VARCHAR, SetWhitelistScalarFun);
+		set_whitelist_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(set_whitelist_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"list"};
+		desc.description = "Set the list of allowed functions in whitelist security mode.";
+		desc.examples = {"func_apply_set_whitelist(['upper', 'lower', 'abs'])"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_set_validator(func_name VARCHAR) -> VARCHAR
-	auto set_validator_func =
-	    ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetValidatorScalarFun);
-	set_validator_func.SetFallible();
-	loader.RegisterFunction(set_validator_func);
+	{
+		auto set_validator_func =
+		    ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetValidatorScalarFun);
+		set_validator_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(set_validator_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"func_name"};
+		desc.description = "Set a custom SQL validator function to check candidate function invocations.";
+		desc.examples = {"func_apply_set_validator('my_validator')"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
-	auto set_on_block_func =
-	    ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetOnBlockScalarFun);
-	set_on_block_func.SetFallible();
-	loader.RegisterFunction(set_on_block_func);
+	{
+		auto set_on_block_func =
+		    ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetOnBlockScalarFun);
+		set_on_block_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(set_on_block_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"behavior"};
+		desc.description = "Set behavior when a blocked function is called ('error', 'null', or 'default').";
+		desc.examples = {"func_apply_set_on_block('error')"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_set_block_default(value ANY) -> VARCHAR
-	auto set_block_default_func = ScalarFunction("func_apply_set_block_default", {LogicalType::ANY},
-	                                             LogicalType::VARCHAR, SetBlockDefaultScalarFun);
-	set_block_default_func.SetFallible();
-	loader.RegisterFunction(set_block_default_func);
+	{
+		auto set_block_default_func = ScalarFunction("func_apply_set_block_default", {LogicalType::ANY},
+		                                             LogicalType::VARCHAR, SetBlockDefaultScalarFun);
+		set_block_default_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(set_block_default_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"value"};
+		desc.description = "Set the default return value when a blocked function is encountered.";
+		desc.examples = {"func_apply_set_block_default('BLOCKED')"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_lock_security() -> VARCHAR
-	auto lock_security_func =
-	    ScalarFunction("func_apply_lock_security", {}, LogicalType::VARCHAR, LockSecurityScalarFun);
-	lock_security_func.SetFallible();
-	loader.RegisterFunction(lock_security_func);
+	{
+		auto lock_security_func =
+		    ScalarFunction("func_apply_lock_security", {}, LogicalType::VARCHAR, LockSecurityScalarFun);
+		lock_security_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(lock_security_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.description = "Lock the current security configuration to prevent further modifications.";
+		desc.examples = {"func_apply_lock_security()"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// func_apply_get_security_config() -> VARCHAR
-	auto get_security_config_func =
-	    ScalarFunction("func_apply_get_security_config", {}, LogicalType::VARCHAR, GetSecurityConfigScalarFun);
-	get_security_config_func.SetFallible();
-	loader.RegisterFunction(get_security_config_func);
+	{
+		auto get_security_config_func =
+		    ScalarFunction("func_apply_get_security_config", {}, LogicalType::VARCHAR, GetSecurityConfigScalarFun);
+		get_security_config_func.SetFallible();
+		CreateScalarFunctionInfo info(std::move(get_security_config_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.description = "Get the current security configuration as a JSON string.";
+		desc.examples = {"func_apply_get_security_config()"};
+		desc.categories = {"func_apply", "security"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 void FuncApplyExtension::Load(ExtensionLoader &loader) {
