@@ -1456,7 +1456,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		FunctionDescription desc;
 		desc.parameter_names = {"mode"};
-		desc.description = "Set the security mode for dynamic function execution ('permissive', 'whitelist', or 'blacklist').";
+		desc.description =
+		    "Set the security mode for dynamic function execution ('permissive', 'whitelist', or 'blacklist').";
 		desc.examples = {"func_apply_set_security_mode('permissive')"};
 		desc.categories = {"func_apply", "security"};
 		info.descriptions.push_back(desc);
@@ -1497,8 +1498,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// func_apply_set_validator(func_name VARCHAR) -> VARCHAR
 	{
-		auto set_validator_func =
-		    ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetValidatorScalarFun);
+		auto set_validator_func = ScalarFunction("func_apply_set_validator", {LogicalType::VARCHAR},
+		                                         LogicalType::VARCHAR, SetValidatorScalarFun);
 		set_validator_func.SetFallible();
 		CreateScalarFunctionInfo info(std::move(set_validator_func));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
@@ -1513,8 +1514,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// func_apply_set_on_block(behavior VARCHAR) -> VARCHAR
 	{
-		auto set_on_block_func =
-		    ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SetOnBlockScalarFun);
+		auto set_on_block_func = ScalarFunction("func_apply_set_on_block", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		                                        SetOnBlockScalarFun);
 		set_on_block_func.SetFallible();
 		CreateScalarFunctionInfo info(std::move(set_on_block_func));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
