@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include <type_traits>
 
 //===--------------------------------------------------------------------===//
@@ -446,5 +447,67 @@ inline VALUE *CompatFlatDataMutable(Vector &vec) {
 // `SELECT v, f(v) FROM (VALUES ('x'), (NULL)) t(v)`. `SELECT f(NULL)` returns
 // NULL on every version because constant folding propagates the null above the
 // function before it runs, which hides the bug completely.
+
+// --- ConstantExpression from a Value ------------------------------------------
+// v1.5: `explicit ConstantExpression(Value)`.
+// v2.0: that constructor is `= delete`d outright -- "Values are not literals" --
+//       and replaced by `static unique_ptr<ParsedExpression> FromValue(const Value &)`.
+//
+// So `make_uniq<ConstantExpression>(value)` fails on v2.0 at the make_uniq
+// forwarding site, which is why the diagnostic points into
+// duckdb/common/helper.hpp rather than at our call:
+//
+//   helper.hpp:77: error: use of deleted function
+//     'duckdb::ConstantExpression::ConstantExpression(const duckdb::Value&)'
+//
+// This is not a rename: FromValue may return a literal, a constructor call for a
+// nested value, or a cast. Our three call sites all push into
+// vector<unique_ptr<ParsedExpression>>, so the richer return type slots in.
+//
+// Probe the thing that changed -- whether FromValue exists -- per this header's
+// rule, and keep it tag dispatch so the file still compiles at C++11.
+//
+// Ported from teaguesterling/duckdb_zim's duckdb_compat.hpp, the reference
+// implementation for this change.
+template <class T, class = void>
+struct CompatHasFromValue : std::false_type {};
+template <class T>
+struct CompatHasFromValue<T, decltype(void(T::FromValue(std::declval<const Value &>())))> : std::true_type {};
+
+template <class CE>
+inline unique_ptr<ParsedExpression> CompatConstantImpl(Value value, std::true_type) {
+	return CE::FromValue(value);
+}
+template <class CE>
+inline unique_ptr<ParsedExpression> CompatConstantImpl(Value value, std::false_type) {
+	return make_uniq<CE>(std::move(value));
+}
+
+//! A parsed expression for a literal value, on either DuckDB line.
+template <class CE = ConstantExpression>
+inline unique_ptr<ParsedExpression> CompatConstant(Value value) {
+	return CompatConstantImpl<CE>(std::move(value), CompatHasFromValue<CE>());
+}
+
+// BOTH ANSWERS ARE PINNED, not just the one our pin happens to give. A detector
+// tested only against the line you build on is half-checked: it would pass
+// identically if it always returned false, which is exactly the answer v1.5
+// wants and v2.0 does not. These cost nothing at runtime and fail the build the
+// day the probe stops discriminating.
+namespace compat_detail {
+//! Shaped like v2.0's ConstantExpression: Value constructor deleted, FromValue present.
+struct HasFromValueProbe {
+	explicit HasFromValueProbe(const Value &) = delete;
+	static unique_ptr<ParsedExpression> FromValue(const Value &);
+};
+//! Shaped like v1.5's: a Value constructor and no FromValue.
+struct NoFromValueProbe {
+	explicit NoFromValueProbe(Value);
+};
+static_assert(CompatHasFromValue<HasFromValueProbe>::value,
+              "CompatHasFromValue must detect FromValue where it exists (the v2.0 shape)");
+static_assert(!CompatHasFromValue<NoFromValueProbe>::value,
+              "CompatHasFromValue must not fire where FromValue is absent (the v1.5 shape)");
+} // namespace compat_detail
 
 } // namespace duckdb

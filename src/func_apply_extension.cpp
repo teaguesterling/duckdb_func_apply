@@ -622,7 +622,7 @@ static Value ExecuteFunctionInternal(ClientContext &context, const string &func_
 		// Instead, create a parsed FunctionExpression and bind it through ConstantBinder.
 		vector<unique_ptr<ParsedExpression>> parsed_args;
 		for (auto &arg : args) {
-			parsed_args.push_back(make_uniq<ConstantExpression>(arg));
+			parsed_args.push_back(CompatConstant(arg));
 		}
 
 		unique_ptr<ParsedExpression> func_expr =
@@ -715,11 +715,11 @@ static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
 			// Try to evaluate constant expressions, otherwise create a placeholder
 			if (arguments[i]->IsFoldable()) {
 				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
-				parsed_args.push_back(make_uniq<ConstantExpression>(val));
+				parsed_args.push_back(CompatConstant(val));
 			} else {
 				// For non-constant expressions, we need to use the expression's type
 				// Create a constant with a dummy value of the right type
-				parsed_args.push_back(make_uniq<ConstantExpression>(Value(CompatExprReturnType(*arguments[i]))));
+				parsed_args.push_back(CompatConstant(Value(CompatExprReturnType(*arguments[i]))));
 			}
 		}
 
