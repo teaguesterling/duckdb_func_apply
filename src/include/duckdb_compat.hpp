@@ -252,9 +252,7 @@ inline void CompatSetScalarReturnType(ScalarFunction &f, LogicalType t) {
 inline void CompatSetScalarNullHandling(ScalarFunction &f, FunctionNullHandling h) {
 	f.SetNullHandling(h);
 }
-inline void CompatSetScalarVarArgs(ScalarFunction &f, LogicalType v) {
-	f.SetVarArgs(std::move(v));
-}
+// CompatSetScalarVarArgs now lives below, SFINAE-detected across all three lines.
 
 #else
 
@@ -279,11 +277,97 @@ inline void CompatSetScalarReturnType(ScalarFunction &f, LogicalType t) {
 inline void CompatSetScalarNullHandling(ScalarFunction &f, FunctionNullHandling h) {
 	f.null_handling = h;
 }
-inline void CompatSetScalarVarArgs(ScalarFunction &f, LogicalType v) {
-	f.varargs = std::move(v);
-}
+// CompatSetScalarVarArgs now lives below, SFINAE-detected across all three lines.
 
 #endif
+
+//===--------------------------------------------------------------------===//
+// varargs: a MEMBER on v1.5, an ACCESSOR on duckdb main, a SIGNATURE PARAMETER
+// on v2.0-cyanoptera
+//===--------------------------------------------------------------------===//
+//
+// Three shapes, not two:
+//   v1.5.6       f.varargs = T;                        (public member; SetVarArgs also exists)
+//   duckdb main  f.SetVarArgs(T);                      (member still there, accessor preferred)
+//   cyanoptera   f.GetSignature().AddArgs(name, T);    (BOTH gone; varargs became a
+//                                                       VAR_POSITIONAL signature parameter)
+//
+// What was here before branched on DUCKDB_HAS_NEW_VECTOR_HEADERS and called
+// SetVarArgs for the "new" line. That is right for duckdb main and WRONG for
+// cyanoptera, which has neither the member nor the accessor. It was invisible
+// because this repo's canary builds `duckdb_version: main`, where SetVarArgs
+// exists -- so the branch was never exercised against the line it was meant for.
+// A hardcoded modern branch is only as trustworthy as the line your canary builds.
+//
+// Detect SetVarArgs rather than the member: v1.5.6 and main BOTH have it, only
+// cyanoptera lacks it, so one probe splits the three lines correctly.
+//
+// BOTH overloads MUST be templates. Tag dispatch picks which one is CALLED, but a
+// non-template inline function is type-checked whether it is called or not -- so a
+// plain overload pair still compiles the SetVarArgs body against cyanoptera and
+// fails there. duckdb_webbed hit exactly this on its #172.
+//
+// On cyanoptera these are DISTINCT parameter kinds: AddArgs is VAR_POSITIONAL,
+// AddKwargs is VAR_KEYWORD, and WithTypedKwargs is the declared-named-parameter
+// group (function.hpp:348-357). Which of them a `varargs` member translates to
+// depends on the call sites, so see the per-kind note below -- scalar and table
+// need different answers here, and the first version of this shim got it wrong by
+// reasoning from the API shape instead of testing the calls.
+// The VAR_POSITIONAL parameter is named "varargs" rather than "args" because
+// apply_table_with declares named parameters literally called "args" and
+// "kwargs"; a VAR_POSITIONAL called "args" would clash with them.
+template <class T, class = void>
+struct CompatHasSetVarArgs : std::false_type {};
+template <class T>
+struct CompatHasSetVarArgs<T, decltype(void(std::declval<T &>().SetVarArgs(std::declval<LogicalType>())))>
+    : std::true_type {};
+
+// SCALAR vs TABLE need DIFFERENT cyanoptera translations, and this was measured,
+// not reasoned. A v1.5 `varargs` member absorbs BOTH positional and named
+// arguments. Our scalar functions rely on that: apply_with is called as
+//     apply_with('upper', args := ['hello'])
+// and nothing else declares `args`, so VAR_POSITIONAL alone is not enough -- with
+// AddArgs only, cyanoptera answers "Binder Error: No function matches the given
+// name". It needs the VAR_KEYWORD catch-all too.
+// The table functions are the opposite case: apply_table_with declares `args` and
+// `kwargs` explicitly through WithTypedKwargs, so adding a VAR_KEYWORD parameter
+// there would duplicate what the typed-kwargs group already provides. AddArgs
+// alone is correct for them, and verified: apply_table_with('range', args := [5])
+// binds and returns rows on both lines.
+template <class FUNC>
+inline void CompatSetScalarVarArgsImpl(FUNC &func, LogicalType varargs, std::true_type) {
+	// v1.5.6 and duckdb main.
+	func.SetVarArgs(std::move(varargs));
+}
+template <class FUNC>
+inline void CompatSetScalarVarArgsImpl(FUNC &func, LogicalType varargs, std::false_type) {
+	// v2.0-cyanoptera: variadic positional AND a keyword catch-all.
+	// Two statements, not a chained call: with `AddArgs(x, v).AddKwargs(y, move(v))`
+	// the move is not guaranteed to be sequenced after the first call before C++17,
+	// so the first could silently receive a moved-from type.
+	auto &signature = func.GetSignature();
+	signature.AddArgs("varargs", varargs);
+	signature.AddKwargs("kwargs", std::move(varargs));
+}
+
+template <class FUNC>
+inline void CompatSetTableVarArgsImpl(FUNC &func, LogicalType varargs, std::true_type) {
+	func.SetVarArgs(std::move(varargs));
+}
+template <class FUNC>
+inline void CompatSetTableVarArgsImpl(FUNC &func, LogicalType varargs, std::false_type) {
+	// VAR_POSITIONAL only; named parameters are declared separately.
+	func.GetSignature().AddArgs("varargs", std::move(varargs));
+}
+
+inline void CompatSetScalarVarArgs(ScalarFunction &f, LogicalType v) {
+	CompatSetScalarVarArgsImpl(f, std::move(v), CompatHasSetVarArgs<ScalarFunction>());
+}
+//! Same for table functions. These used to assign `.varargs` directly, bypassing
+//! the shim entirely, which is why they broke on cyanoptera independently.
+inline void CompatSetTableVarArgs(TableFunction &f, LogicalType v) {
+	CompatSetTableVarArgsImpl(f, std::move(v), CompatHasSetVarArgs<TableFunction>());
+}
 
 //! BaseExpression::GetAlias() exists on both lines; only its return type moved
 //! (string -> Identifier), so this needs no #ifdef, just the name helper.
