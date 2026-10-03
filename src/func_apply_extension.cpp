@@ -51,6 +51,7 @@
 //
 //===--------------------------------------------------------------------===//
 
+#include "named_parameter_compat.hpp"
 #include "func_apply_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb_compat.hpp"
@@ -1410,7 +1411,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Uses bind_replace to generate SQL dynamically
 	{
 		TableFunction apply_table_func("apply_table", {LogicalType::VARCHAR}, nullptr, nullptr);
-		apply_table_func.varargs = LogicalType::ANY;
+		CompatSetTableVarArgs(apply_table_func, LogicalType::ANY);
 		apply_table_func.bind_replace = ApplyTableBindReplace;
 		CreateTableFunctionInfo info(std::move(apply_table_func));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
@@ -1427,9 +1428,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Uses bind_replace to generate SQL dynamically
 	{
 		TableFunction apply_table_with_func("apply_table_with", {LogicalType::VARCHAR}, nullptr, nullptr);
-		apply_table_with_func.varargs = LogicalType::ANY;
-		apply_table_with_func.named_parameters["args"] = LogicalType::ANY;
-		apply_table_with_func.named_parameters["kwargs"] = LogicalType::ANY;
+		CompatSetTableVarArgs(apply_table_with_func, LogicalType::ANY);
+		DeclareNamedParameters(apply_table_with_func, {{"args", LogicalType::ANY}, {"kwargs", LogicalType::ANY}});
 		apply_table_with_func.bind_replace = ApplyTableWithBindReplace;
 		CreateTableFunctionInfo info(std::move(apply_table_with_func));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
