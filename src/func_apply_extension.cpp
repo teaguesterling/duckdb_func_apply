@@ -929,9 +929,23 @@ static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &
 // apply_table(func VARCHAR, ...args ANY) -> TABLE
 //===--------------------------------------------------------------------===//
 
-// Helper function to parse a query into a SubqueryRef
-static unique_ptr<SubqueryRef> ParseSubquery(const string &query, const ParserOptions &options) {
-	Parser parser(options);
+// Helper function to parse a query into a SubqueryRef.
+//
+// DuckDB v2.0-cyanoptera made BOTH ClientContext::GetParserOptions() and the
+// ParserOptions default constructor private, so the v1.5.6 idiom
+// `Parser(context.GetParserOptions())` no longer compiles there. Each line has a
+// different public construction path, so gate on SITTING_DUCK_HAS_TYPED_KWARGS
+// (defined in named_parameter_compat.hpp from the cyanoptera-only capi header):
+//   - cyanoptera: the public context-aware Parser ctor, which pulls the session's
+//     parser config internally.
+//   - v1.5.6: construct from the context's parser options (public there).
+// Both preserve the session's parser settings for parsing the generated SELECT.
+static unique_ptr<SubqueryRef> ParseSubquery(ClientContext &context, const string &query) {
+#ifdef SITTING_DUCK_HAS_TYPED_KWARGS
+	Parser parser(context);
+#else
+	Parser parser(context.GetParserOptions());
+#endif
 	parser.ParseQuery(query);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw BinderException("apply_table: expected a single SELECT statement from generated query");
@@ -1011,7 +1025,7 @@ static unique_ptr<TableRef> ApplyTableBindReplace(ClientContext &context, TableF
 	}
 
 	// Parse and return as subquery
-	return ParseSubquery(sql, context.GetParserOptions());
+	return ParseSubquery(context, sql);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1118,7 +1132,7 @@ static unique_ptr<TableRef> ApplyTableWithBindReplace(ClientContext &context, Ta
 	sql += ")";
 
 	// Parse and return as subquery
-	return ParseSubquery(sql, context.GetParserOptions());
+	return ParseSubquery(context, sql);
 }
 
 //===--------------------------------------------------------------------===//
