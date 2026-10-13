@@ -134,8 +134,14 @@ apply_table
 statement error
 SELECT func_dispatch(MAP{'git': 'route_git'});
 ----
-requires
+No function matches
 ```
+
+Note on that last case: DuckDB's overload resolution rejects a one-argument call
+before `BindFuncDispatch` runs, so the error is DuckDB's, not ours. Measured:
+`SELECT apply();` gives `Binder Error: No function matches the given name and
+argument types`. The `arguments.size() < 2` check in bind is therefore unreachable
+with the declared signature; keep it as cheap defense, but do not expect it to fire.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -407,10 +413,13 @@ SELECT func_dispatch(MAP{'a': 'range'}, 'a', 1);
 apply_table
 
 # --- non-foldable routing table: still dispatches, documented VARCHAR ---
+# A projected column is never foldable: bind runs before optimization, so both of
+# these are VARCHAR. Measured via the apply proxy:
+#   typeof(apply(r, 41)) FROM (SELECT 'm_int' AS r) s  ->  VARCHAR
 query I
 SELECT typeof(func_dispatch(r, 'a', 41)) FROM (SELECT MAP{'a': 'm_int'} AS r) s;
 ----
-INTEGER
+VARCHAR
 
 query II
 SELECT func_dispatch(r, k, 41), typeof(func_dispatch(r, k, 41))
