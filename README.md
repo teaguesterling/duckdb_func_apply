@@ -90,6 +90,8 @@ parameters. (`apply_table_with` *does* support `kwargs` — see below.)
 Dispatches to the function named by `routes[key]`, forwarding `...args`.
 
 ```sql
+LOAD urlpattern;
+
 CREATE MACRO get_git_object_path(p) AS 'GIT:' || regexp_replace(p, '^git://', '');
 CREATE MACRO get_http_path(p) AS 'HTTP:' || p;
 
@@ -119,7 +121,8 @@ SELECT typeof(func_dispatch(MAP{'a':'pair'}, 'a', 7));                 -- INTEGE
 | `key` missing from `routes` | `NULL` |
 | `key` is `NULL` | `NULL` |
 | `routes` contains a `'*'` entry | used when `key` is missing |
-| candidates return different types | unified where an implicit cast exists (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error otherwise, which includes `INTEGER`+`VARCHAR` |
+| candidates return different types | unified where an implicit cast exists (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error otherwise, which includes `INTEGER`+`VARCHAR` — true even if one candidate's body is a bare literal |
+| a candidate can't be bound against the forwarded arguments (e.g. wrong arity) | the **whole call** silently falls back to `VARCHAR`, as if `routes` were not a constant, no matter what the other candidates agree on; that candidate's arity is only caught if it's actually invoked, at run time |
 | `routes` is not a constant | works, but the return type falls back to `VARCHAR` |
 
 **Watch the key extractor.** The map key must match exactly what the extractor

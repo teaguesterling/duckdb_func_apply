@@ -653,12 +653,25 @@ Resolves `routes[key]` to a scalar function or macro name and calls it with
 when neither matches, when `key` is `NULL`, or when `routes` is `NULL` or empty.
 
 **Return type.** When `routes` is a constant, every candidate is bound at plan
-time and the return types are unified with DuckDB's normal type promotion; that
-unified type is the function's return type. Promotion only applies where an
-implicit cast exists: `INTEGER` and `BIGINT` unify to `BIGINT`, but `INTEGER` and
-`VARCHAR` do not unify at all and raise a bind error. In practice a routing map
-should dispatch to functions that agree on a return type. When `routes` is not a constant the
-return type is `VARCHAR`, as with `apply()`.
+time against the forwarded arguments, and the return types are unified with
+DuckDB's normal type promotion; that unified type is the function's return
+type. Promotion only applies where an implicit cast exists: `INTEGER` and
+`BIGINT` unify to `BIGINT`; `INTEGER` and `VARCHAR` (like `LIST` and `STRUCT`)
+have no common type and raise a bind error — this holds even when one
+candidate's body is a bare literal, so a literal return value gets no special
+treatment.
+
+A candidate is only unified, though, if it can be bound at all against the
+forwarded arguments. If any candidate's declared parameters don't match what
+the call forwards — wrong arity, or an argument with no cast to the declared
+parameter type — that candidate can't be type-checked, and the **whole call**
+silently falls back to `VARCHAR`, exactly as if `routes` were not a constant,
+regardless of what every other candidate agreed on. That mismatched
+candidate's arity is then only caught if it is actually invoked at run time,
+where it raises an unrelated-looking runtime error rather than a bind error.
+In practice a routing map should dispatch to functions that both agree on a
+return type and all accept the arguments the call site forwards. When
+`routes` is not a constant the return type is `VARCHAR`, as with `apply()`.
 
 **Bind-time errors:** a candidate that does not exist, is a table function, has
 a non-identifier name, or is `NULL`; and candidates whose return types cannot be
