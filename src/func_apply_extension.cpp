@@ -1210,8 +1210,7 @@ static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
 		auto func_type = GetCallableFunctionType(context, candidate);
 		if (func_type == CatalogType::INVALID) {
 			if (TableFunctionExists(context, candidate)) {
-				throw BinderException("func_dispatch: '%s' is a table function. Use apply_table() instead.",
-				                      candidate);
+				throw BinderException("func_dispatch: '%s' is a table function. Use apply_table() instead.", candidate);
 			}
 			throw BinderException("func_dispatch: function '%s' does not exist", candidate);
 		}
@@ -1794,10 +1793,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	}
 
 	// Register func_dispatch (map-driven dispatch, variadic forwarded args)
-	auto func_dispatch_func = ScalarFunction("func_dispatch",
-	                                         {LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
-	                                          LogicalType::VARCHAR},
-	                                         LogicalType::ANY, FuncDispatchScalarFun, BindFuncDispatch);
+	auto func_dispatch_func = ScalarFunction(
+	    "func_dispatch", {LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), LogicalType::VARCHAR},
+	    LogicalType::ANY, FuncDispatchScalarFun, BindFuncDispatch);
 	CompatSetScalarVarArgs(func_dispatch_func, LogicalType::ANY);
 	CompatSetScalarNullHandling(func_dispatch_func, FunctionNullHandling::SPECIAL_HANDLING);
 	// func_dispatch never reads argument aliases -- forwarding is purely positional,
