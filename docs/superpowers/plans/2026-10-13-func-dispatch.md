@@ -780,7 +780,7 @@ SELECT typeof(func_dispatch(MAP{'a':'pair'}, 'a', 7));                 -- INTEGE
 | `key` missing from `routes` | `NULL` |
 | `key` is `NULL` | `NULL` |
 | `routes` contains a `'*'` entry | used when `key` is missing |
-| candidates return different types | unified (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error if they have no common type |
+| candidates return different types | unified where an implicit cast exists (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error otherwise, which includes `INTEGER`+`VARCHAR` |
 | `routes` is not a constant | works, but the return type falls back to `VARCHAR` |
 
 **Watch the key extractor.** The map key must match exactly what the extractor
@@ -812,7 +812,10 @@ when neither matches, when `key` is `NULL`, or when `routes` is `NULL` or empty.
 
 **Return type.** When `routes` is a constant, every candidate is bound at plan
 time and the return types are unified with DuckDB's normal type promotion; that
-unified type is the function's return type. When `routes` is not a constant the
+unified type is the function's return type. Promotion only applies where an
+implicit cast exists: `INTEGER` and `BIGINT` unify to `BIGINT`, but `INTEGER` and
+`VARCHAR` do not unify at all and raise a bind error. In practice a routing map
+should dispatch to functions that agree on a return type. When `routes` is not a constant the
 return type is `VARCHAR`, as with `apply()`.
 
 **Bind-time errors:** a candidate that does not exist, is a table function, has

@@ -92,9 +92,9 @@ At bind time, if `routes` is foldable:
 4. Unify the candidate return types left to right with
    `LogicalType::TryGetMaxLogicalType(context, left, right, out)`, which returns
    false rather than throwing when no common type exists.
-   `INTEGER + BIGINT -> BIGINT`; `INTEGER + VARCHAR -> VARCHAR`. If any pair has
-   no common type (e.g. `STRUCT` vs `LIST`), raise a `BinderException` naming
-   both candidates and both types.
+   `INTEGER + BIGINT -> BIGINT`. Pairs with no implicit cast raise a
+   `BinderException` naming both candidates and both types; measured, this
+   includes `INTEGER`/`VARCHAR` and `LIST`/`STRUCT`.
 5. Set the unified type as the function's return type.
 
 If `routes` is **not** foldable, fall back to VARCHAR with the same behavior as
@@ -189,10 +189,17 @@ flipped expectation cannot mask the rest.
 
 ## Risks
 
-1. **Type promotion may surprise.** `INTEGER + VARCHAR -> VARCHAR`
-   means a mixed table silently stringifies the integer branch — the very
-   failure mode this feature exists to fix, now reachable by a different route.
-   Mitigated by documenting it; revisit if it bites.
+1. **~~Type promotion may surprise~~ — MEASURED FALSE, 2026-10-13.** The spec
+   predicted `INTEGER + VARCHAR -> VARCHAR`, silently stringifying the integer
+   branch. DuckDB does not do this: there is no implicit cast between a real
+   (non-literal) INTEGER and VARCHAR, so such a routing map raises a
+   `BinderException` instead. Measured via CASE, which unifies through the same
+   path: `CASE WHEN true THEN i ELSE s END` over an INTEGER and a VARCHAR column
+   gives `Cannot mix values of type VARCHAR and INTEGER`. Only widening pairs
+   unify (`INTEGER + BIGINT -> BIGINT`, confirmed). The practical effect is the
+   stricter "require agreement" behavior, obtained for free from DuckDB's cast
+   rules rather than enforced by us. An INTEGER literal DOES absorb into
+   VARCHAR's side, so a literal-only map can still promote.
 2. **Bind-time binding of every candidate costs plan time** proportional to map
    size. Fine for routing tables of a handful of entries; a thousand-entry map
    would be slow to plan.
