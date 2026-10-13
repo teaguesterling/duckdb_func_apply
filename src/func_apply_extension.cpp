@@ -652,6 +652,58 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 // apply(func VARCHAR, ...args ANY) -> ANY
 //===--------------------------------------------------------------------===//
 
+//! Infer what `func_name` returns when called with `arguments[first_arg_idx..]`.
+//! Handles both scalar functions (FunctionBinder) and macros (full expression
+//! binding against typed placeholders). Returns false when the return type
+//! cannot be determined, in which case the caller keeps its default.
+static bool TryInferCandidateReturnType(ClientContext &context, const string &func_name,
+                                        const vector<unique_ptr<Expression>> &arguments, idx_t first_arg_idx,
+                                        LogicalType &out) {
+	auto func_type = GetCallableFunctionType(context, func_name);
+
+	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		vector<unique_ptr<Expression>> target_args;
+		for (idx_t i = first_arg_idx; i < arguments.size(); i++) {
+			target_args.push_back(arguments[i]->Copy());
+		}
+		ErrorData error;
+		FunctionBinder binder(context);
+		auto bound_expr =
+		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(target_args), error);
+		if (error.HasError() || !bound_expr) {
+			return false;
+		}
+		out = CompatExprReturnType(*bound_expr);
+		return true;
+	}
+
+	if (func_type == CatalogType::MACRO_ENTRY) {
+		vector<unique_ptr<ParsedExpression>> parsed_args;
+		for (idx_t i = first_arg_idx; i < arguments.size(); i++) {
+			if (arguments[i]->IsFoldable()) {
+				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
+				parsed_args.push_back(CompatConstant(val));
+			} else {
+				// A typed NULL placeholder: Value(LogicalType) is a NULL of that type.
+				parsed_args.push_back(CompatConstant(Value(CompatExprReturnType(*arguments[i]))));
+			}
+		}
+		unique_ptr<ParsedExpression> func_expr =
+		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
+		try {
+			auto binder = Binder::CreateBinder(context);
+			ConstantBinder constant_binder(*binder, context, "func_dispatch");
+			auto bound_expr = constant_binder.Bind(func_expr);
+			out = CompatExprReturnType(*bound_expr);
+			return true;
+		} catch (...) {
+			return false;
+		}
+	}
+
+	return false;
+}
+
 static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
 #ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
 	// v2.0 collapsed the three bind parameters into a single input object. Unpack
@@ -688,55 +740,11 @@ static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
 	// Check the function type (only scalar functions and macros are callable via apply)
 	auto func_type = GetCallableFunctionType(context, func_name);
 
-	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-		// For scalar functions, use FunctionBinder directly
-		// FunctionBinder handles overload resolution and type coercion automatically
-		vector<unique_ptr<Expression>> target_args;
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			target_args.push_back(arguments[i]->Copy());
+	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY || func_type == CatalogType::MACRO_ENTRY) {
+		LogicalType inferred;
+		if (TryInferCandidateReturnType(context, func_name, arguments, 1, inferred)) {
+			CompatBindSetReturnType(bound_function, inferred);
 		}
-
-		ErrorData error;
-		FunctionBinder binder(context);
-		auto bound_expr =
-		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(target_args), error);
-
-		if (error.HasError() || !bound_expr) {
-			return nullptr;
-		}
-
-		CompatBindSetReturnType(bound_function, CompatExprReturnType(*bound_expr));
-		return nullptr;
-	}
-
-	if (func_type == CatalogType::MACRO_ENTRY) {
-		// For macros, use the full expression binding path
-		vector<unique_ptr<ParsedExpression>> parsed_args;
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			// Try to evaluate constant expressions, otherwise create a placeholder
-			if (arguments[i]->IsFoldable()) {
-				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
-				parsed_args.push_back(CompatConstant(val));
-			} else {
-				// For non-constant expressions, we need to use the expression's type
-				// Create a constant with a dummy value of the right type
-				parsed_args.push_back(CompatConstant(Value(CompatExprReturnType(*arguments[i]))));
-			}
-		}
-
-		unique_ptr<ParsedExpression> func_expr =
-		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
-
-		try {
-			auto binder = Binder::CreateBinder(context);
-			ConstantBinder constant_binder(*binder, context, "apply");
-			auto bound_expr = constant_binder.Bind(func_expr);
-			CompatBindSetReturnType(bound_function, CompatExprReturnType(*bound_expr));
-		} catch (...) {
-			// If binding fails, fall back to VARCHAR
-			return nullptr;
-		}
-
 		return nullptr;
 	}
 
@@ -970,10 +978,76 @@ static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
 	auto &arguments = bind_input.GetArguments();
 	auto &bound_function = bind_input.GetBoundFunction();
 #endif
-	(void)context;
 	CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
+
 	if (arguments.size() < 2) {
 		throw BinderException("func_dispatch requires a routing map and a key");
+	}
+
+	// A non-foldable routing table is unknowable at plan time: keep VARCHAR.
+	// Documented in docs/limitations.md.
+	if (!arguments[0]->IsFoldable()) {
+		return nullptr;
+	}
+
+	Value routes = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+	if (routes.IsNull()) {
+		return nullptr;
+	}
+
+	auto &entries = MapValue::GetChildren(routes);
+	if (entries.empty()) {
+		return nullptr;
+	}
+
+	LogicalType unified;
+	bool have_unified = false;
+
+	for (auto &entry : entries) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv[1].IsNull()) {
+			throw BinderException("func_dispatch: routing map has a NULL function name");
+		}
+		auto candidate = StringValue::Get(kv[1]);
+		if (!IsValidIdentifier(candidate)) {
+			throw BinderException("func_dispatch: invalid function name '%s'", candidate);
+		}
+
+		auto func_type = GetCallableFunctionType(context, candidate);
+		if (func_type == CatalogType::INVALID) {
+			if (TableFunctionExists(context, candidate)) {
+				throw BinderException("func_dispatch: '%s' is a table function. Use apply_table() instead.",
+				                      candidate);
+			}
+			throw BinderException("func_dispatch: function '%s' does not exist", candidate);
+		}
+
+		LogicalType candidate_type;
+		if (!TryInferCandidateReturnType(context, candidate, arguments, 2, candidate_type)) {
+			// Could not type this candidate: fall back to VARCHAR for the whole call
+			// rather than reporting a type only some branches satisfy.
+			CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
+			return nullptr;
+		}
+
+		if (!have_unified) {
+			unified = candidate_type;
+			have_unified = true;
+			continue;
+		}
+
+		LogicalType merged;
+		if (!LogicalType::TryGetMaxLogicalType(context, unified, candidate_type, merged)) {
+			throw BinderException(
+			    "func_dispatch: candidate return types %s and %s cannot be unified; the routing map must "
+			    "dispatch to functions with a common return type",
+			    unified.ToString(), candidate_type.ToString());
+		}
+		unified = merged;
+	}
+
+	if (have_unified) {
+		CompatBindSetReturnType(bound_function, unified);
 	}
 	return nullptr;
 }

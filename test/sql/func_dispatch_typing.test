@@ -1,0 +1,123 @@
+# name: test/sql/func_dispatch_typing.test
+# description: func_dispatch resolves real return types; apply() cannot
+# group: [sql]
+
+require func_apply
+
+statement ok
+CREATE MACRO m_int(x) AS x + 1;
+
+statement ok
+CREATE MACRO m_list(x) AS [x, x];
+
+statement ok
+CREATE MACRO m_struct(x) AS {'v': x};
+
+statement ok
+CREATE MACRO m_big(x) AS x::BIGINT;
+
+statement ok
+CREATE MACRO m_str(x) AS x::VARCHAR;
+
+# --- CONTROL: apply() with a dynamic name collapses to VARCHAR.
+# These assertions document the defect func_dispatch fixes. If they ever
+# report something other than VARCHAR, the premise of this feature changed.
+query I
+SELECT typeof(apply(MAP{'a': 'm_int'}[k], 41)) FROM (VALUES ('a')) t(k);
+----
+VARCHAR
+
+query I
+SELECT typeof(apply(MAP{'a': 'm_list'}[k], 7)) FROM (VALUES ('a')) t(k);
+----
+VARCHAR
+
+# --- func_dispatch keeps the real type ---
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_int'}, 'a', 41));
+----
+INTEGER
+
+query I
+SELECT func_dispatch(MAP{'a': 'm_int'}, 'a', 41);
+----
+42
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_list'}, 'a', 7));
+----
+INTEGER[]
+
+# a real list, not the string '[7, 7]' -- this is the user-visible payoff
+query I
+SELECT len(func_dispatch(MAP{'a': 'm_list'}, 'a', 7));
+----
+2
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_struct'}, 'a', 7));
+----
+STRUCT(v INTEGER)
+
+query I
+SELECT func_dispatch(MAP{'a': 'm_struct'}, 'a', 7).v;
+----
+7
+
+# --- unification across candidates ---
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_int', 'b': 'm_big'}, 'a', 41));
+----
+BIGINT
+
+# the '*' candidate participates in unification like any other
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_int', '*': 'm_big'}, 'a', 41));
+----
+BIGINT
+
+# --- unification failure is a bind error naming both types ---
+statement error
+SELECT func_dispatch(MAP{'a': 'm_list', 'b': 'm_struct'}, 'a', 7);
+----
+cannot be unified
+
+# INTEGER and VARCHAR are real (non-literal) candidate return types here, not
+# string literals, so DuckDB's implicit-cast table does not unify them (unlike
+# e.g. `CASE WHEN true THEN 1 ELSE 'abc' END`, where the VARCHAR *literal*
+# gets flexible typing and the case binds to INTEGER). TryGetMaxLogicalType
+# correctly reports no common type between two already-typed candidates.
+statement error
+SELECT func_dispatch(MAP{'a': 'm_int', 'b': 'm_str'}, 'a', 41);
+----
+cannot be unified
+
+# --- bind-time validation ---
+statement error
+SELECT func_dispatch(MAP{'a': 'no_such_function_xyz'}, 'a', 1);
+----
+does not exist
+
+# NOTE: not 'range' -- in this DuckDB it is dual-purpose (also a scalar,
+# list-returning function), so GetCallableFunctionType resolves it via the
+# scalar branch before ever checking table functions. duckdb_functions is
+# table-function-only (same choice Task 1's func_dispatch.test makes).
+statement error
+SELECT func_dispatch(MAP{'a': 'duckdb_functions'}, 'a', 1);
+----
+apply_table
+
+# --- non-foldable routing table: still dispatches, documented VARCHAR ---
+# A projected column is never foldable: bind runs before optimization, so both of
+# these are VARCHAR. Measured via the apply proxy:
+#   typeof(apply(r, 41)) FROM (SELECT 'm_int' AS r) s  ->  VARCHAR
+query I
+SELECT typeof(func_dispatch(r, 'a', 41)) FROM (SELECT MAP{'a': 'm_int'} AS r) s;
+----
+VARCHAR
+
+query II
+SELECT func_dispatch(r, k, 41), typeof(func_dispatch(r, k, 41))
+FROM (VALUES (MAP{'a': 'm_int'}, 'a')) t(r, k);
+----
+42	VARCHAR
