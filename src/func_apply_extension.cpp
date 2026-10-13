@@ -664,10 +664,20 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 //!
 //! Magnitudes are deliberately small rather than `Value::MinimumValue(type)`:
 //! MinimumValue(INTEGER) is INT32_MIN, which makes an ordinary body like
-//! `x - 1` raise an overflow during folding and so look unbindable. MinimumValue
-//! is still the fallback for the types not spelled out here (temporals with no
-//! Numeric mapping, ENUM, ...); it throws for nested and other non-numeric
-//! types, so the call is guarded and failure just means "no probe available".
+//! `x - 1` raise an overflow during folding and so look unbindable.
+//!
+//! Every representable type is enumerated explicitly below, including the
+//! temporals -- DATE, TIME[_TZ], TIMESTAMP[_TZ/_SEC/_MS/_NS], INTERVAL, UUID --
+//! each with a small, safe, non-edge value for the same overflow reason as the
+//! numerics. There is deliberately no `default: Value::MinimumValue(type)`
+//! fallback: MinimumValue has no case for LIST/STRUCT/MAP/ARRAY/UNION/ENUM on
+//! EITHER supported DuckDB line (confirmed by reading both trees' value.cpp --
+//! both fall to *its own* default and throw "MinimumValue requires numeric
+//! type"), so that fallback never actually produced a probe for those types on
+//! either line; it only added a reliance on exception-based control flow for a
+//! codepath that always returned false anyway. `default: return false` makes
+//! that outcome a direct fact about this function instead of an accident of
+//! what some other function happens to throw this release.
 static bool TryMakeProbeValue(const LogicalType &type, Value &out) {
 	switch (type.id()) {
 	case LogicalTypeId::INVALID:
@@ -701,17 +711,54 @@ static bool TryMakeProbeValue(const LogicalType &type, Value &out) {
 	case LogicalTypeId::DECIMAL:
 		out = Value::Numeric(type, static_cast<int64_t>(1));
 		return true;
-	default:
-		break;
-	}
-	try {
-		auto candidate = Value::MinimumValue(type);
-		if (candidate.IsNull()) {
-			return false;
-		}
-		out = std::move(candidate);
+	case LogicalTypeId::DATE:
+		// 2000-01-01: far from DATE_MIN/MAX, so date arithmetic in a macro body
+		// (`x - 1`, `x + INTERVAL 1 DAY`, ...) cannot overflow or underflow.
+		out = Value::DATE(2000, 1, 1);
 		return true;
-	} catch (...) {
+	case LogicalTypeId::TIME:
+		out = Value::TIME(12, 0, 0, 0);
+		return true;
+	case LogicalTypeId::TIME_TZ:
+		// 12:00:00+00, built from raw micros-since-midnight to avoid depending on
+		// the Time helper class being in scope here.
+		out = Value::TIMETZ(dtime_tz_t(dtime_t(static_cast<int64_t>(12LL * 3600 * 1000000)), 0));
+		return true;
+	case LogicalTypeId::TIMESTAMP:
+		out = Value::TIMESTAMP(2000, 1, 1, 12, 0, 0, 0);
+		return true;
+	case LogicalTypeId::TIMESTAMP_TZ:
+		// Same instant as the TIMESTAMP probe above, expressed in micros-since-epoch.
+		out = Value::TIMESTAMPTZ(timestamp_tz_t(static_cast<int64_t>(946728000000000LL)));
+		return true;
+	case LogicalTypeId::TIMESTAMP_SEC:
+		out = Value::TIMESTAMPSEC(timestamp_sec_t(static_cast<int64_t>(946728000LL)));
+		return true;
+	case LogicalTypeId::TIMESTAMP_MS:
+		out = Value::TIMESTAMPMS(timestamp_ms_t(static_cast<int64_t>(946728000000LL)));
+		return true;
+	case LogicalTypeId::TIMESTAMP_NS:
+		out = Value::TIMESTAMPNS(timestamp_ns_t(static_cast<int64_t>(946728000000000000LL)));
+		return true;
+	case LogicalTypeId::INTERVAL:
+		// Zero interval: adding/subtracting it can never overflow a probe on the
+		// other side of a `+`/`-` either.
+		out = Value::INTERVAL(0, 0, 0);
+		return true;
+	case LogicalTypeId::UUID:
+		out = Value::UUID(hugeint_t(1));
+		return true;
+	default:
+		// Nested types (LIST, STRUCT, MAP, ARRAY, UNION), ENUM, and anything
+		// introduced after this list was written: no safe concrete probe is
+		// available. Previously this fell through to `Value::MinimumValue(type)`
+		// in a try/catch; that throws "MinimumValue requires numeric type" for
+		// every one of these on both v1.5.6 and v2.0-cyanoptera (neither has a
+		// case for them), so the catch always returned false anyway. Returning
+		// false directly here removes the dependence on exception behavior and
+		// makes the "no probe for this type" outcome identical by construction
+		// on every DuckDB line, present and future, rather than identical only
+		// because two unrelated functions both happen to throw today.
 		return false;
 	}
 }
@@ -771,9 +818,24 @@ static InferOutcome TryInferCandidateReturnType(ClientContext &context, const st
 			} else {
 				Value probe;
 				if (!TryMakeProbeValue(CompatExprReturnType(*arguments[i]), probe)) {
-					// Nothing better available: a typed NULL still exercises arity and
-					// overload resolution, and an SQLNULL result is caught below.
-					probe = Value(CompatExprReturnType(*arguments[i]));
+					// No safe probe exists for this argument's type (a nested type --
+					// LIST, STRUCT, MAP, ARRAY, UNION -- or anything else
+					// TryMakeProbeValue does not enumerate). An earlier version of this
+					// code still substituted a typed NULL here and asked the binder to
+					// judge it anyway, reasoning that an SQLNULL result would be caught
+					// below. But whether `<op>(..., NULL::<nested type>)` binds at all is
+					// itself a version-dependent judgment call, not a fact about the
+					// macro: measured directly, v1.5.6 permits
+					// `'GIT:' || NULL::INTEGER[]` (it folds to a bare SQLNULL constant,
+					// caught below) while v2.0-cyanoptera refuses the same call outright
+					// (a genuine Binder Error, caught by the catch(...) below as
+					// UNBINDABLE) -- which is exactly what turned a LIST-valued argument
+					// to a constant-routing-map candidate into a spurious bind error in
+					// CI instead of the documented VARCHAR fallback. Deciding
+					// INDETERMINATE right here, before any version-specific binder gets a
+					// vote, is the only way to make that decision identical on both
+					// lines. See test/sql/func_dispatch_typing.test's LIST/STRUCT cases.
+					return InferOutcome::INDETERMINATE;
 				}
 				parsed_args.push_back(CompatConstant(std::move(probe)));
 			}

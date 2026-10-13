@@ -245,12 +245,42 @@ FROM (VALUES ('z')) t(u);
 ----
 VARCHAR	z
 
-# Same for an argument type with no cheap probe value (a LIST): fall back to
-# VARCHAR rather than inferring INTEGER from the folded-away NULL.
+# Same for an argument type with no cheap probe value (LIST or STRUCT): fall
+# back to VARCHAR rather than inferring INTEGER from the folded-away NULL.
+#
+# These two assertions are the contract between the two supported DuckDB
+# lines, not just a regression test: TryMakeProbeValue has no probe for a
+# nested type on either line, and the two lines disagree about whether a
+# typed-NULL stand-in of a nested type is even bindable against an arbitrary
+# macro body (v1.5.6: yes, folds to SQLNULL; v2.0-cyanoptera: no, a genuine
+# Binder Error). A constant routing map must still resolve to VARCHAR here on
+# BOTH lines -- if either assertion ever raises "cannot be called with the
+# forwarded arguments" instead of returning VARCHAR, the two lines have
+# diverged again (this is exactly what CI caught before this fix: the LIST
+# case below threw a bind error on v2.0-cyanoptera while passing here).
 query I
 SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', u)) FROM (VALUES ([1, 2])) t(u);
 ----
 VARCHAR
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', u)) FROM (VALUES ({'v': 1})) t(u);
+----
+VARCHAR
+
+# --- the temporal probes are real, concrete values now, not an incidental
+# MinimumValue() throw-and-catch that happened to behave the same on both
+# lines. Pin the OUTCOME (DATE infers as DATE) rather than the mechanism: this
+# must hold because TryMakeProbeValue now enumerates DATE explicitly, not
+# because some other function's default case happened to throw.
+statement ok
+CREATE MACRO m_next_day(x) AS x + 1;
+
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_next_day'}, 'a', u)), func_dispatch(MAP{'a': 'm_next_day'}, 'a', u)
+FROM (VALUES (DATE '2024-01-01')) t(u);
+----
+DATE	2024-01-02
 
 # --- unresolved forwarded argument types are not judged ---
 # A bare NULL literal carries no type (SQLNULL), so no route can be judged
