@@ -938,7 +938,11 @@ static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &
 //===--------------------------------------------------------------------===//
 
 //! Routing-table key whose value is used when the dispatch key is absent.
-//! A literal '*' therefore cannot be a dispatch key; documented in docs/limitations.md.
+//! A literal '*' CAN still be a dispatch key: LookupRoute's exact-match pass finds
+//! it like any other key, so func_dispatch(MAP{'*':'upper'}, '*', 'x') -> 'X'. The
+//! real limitation is narrower: '*' cannot route anywhere DIFFERENT from the
+//! fallback, because any exact match on '*' and the wildcard fallback read the same
+//! map entry. Documented in docs/limitations.md.
 static constexpr const char *FUNC_DISPATCH_WILDCARD = "*";
 
 //! Resolve `key` against a MAP value, falling back to FUNC_DISPATCH_WILDCARD.
@@ -1024,10 +1028,17 @@ static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
 
 		LogicalType candidate_type;
 		if (!TryInferCandidateReturnType(context, candidate, arguments, 2, candidate_type)) {
-			// Could not type this candidate: fall back to VARCHAR for the whole call
-			// rather than reporting a type only some branches satisfy.
-			CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
-			return nullptr;
+			// Silently falling back to VARCHAR here produced a wrong VALUE, not merely
+			// a weaker type: len(func_dispatch(MAP{'a':'m_list1','b':'m_two'}, 'a', 7))
+			// returned 6 (the character count of the stringified '[7, 7]') instead of 2,
+			// from a fully constant routing map. A route that cannot accept the forwarded
+			// arguments is already unusable -- invoking it throws "Macro ... does not
+			// support the supplied arguments" -- so surface that at bind time instead of
+			// papering over it.
+			throw BinderException("func_dispatch: candidate '%s' cannot be called with the forwarded arguments; "
+			                      "every route in a constant routing map must accept them "
+			                      "(or make the routing map non-constant to fall back to VARCHAR)",
+			                      candidate);
 		}
 
 		if (!have_unified) {
@@ -1591,12 +1602,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                         LogicalType::ANY, FuncDispatchScalarFun, BindFuncDispatch);
 	CompatSetScalarVarArgs(func_dispatch_func, LogicalType::ANY);
 	CompatSetScalarNullHandling(func_dispatch_func, FunctionNullHandling::SPECIAL_HANDLING);
-	// Forwarded arguments may be aliased (func_dispatch(m, k, x, b := 'y')). v2.0
-	// defaults alias capture OFF, and without this the aliases arrive empty and every
-	// named argument is silently treated as positional -- runtime breakage, green build.
+	// func_dispatch never reads argument aliases -- forwarding is purely positional,
+	// and a named arg like `b := 'y'` is silently matched by position, not by name.
+	// This call is retained anyway, for argument-acceptance parity with apply_with:
+	// whether v2.0 accepts a named argument here at all is governed by the same flag
+	// (unverified whether dropping it would cause v2.0 to reject named args outright).
 	CompatSetCaptureArgumentAliases(func_dispatch_func);
 	func_dispatch_func.SetFallible();
-	loader.RegisterFunction(func_dispatch_func);
+	{
+		CreateScalarFunctionInfo info(std::move(func_dispatch_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"routes", "key"};
+		desc.description = "Dispatch to the function named by routes[key], forwarding the remaining arguments.";
+		desc.examples = {"func_dispatch(MAP {'a': 'upper', '*': 'lower'}, 'a', 'hello')"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// Register apply_table (table function with variadic args)
 	// Uses bind_replace to generate SQL dynamically
