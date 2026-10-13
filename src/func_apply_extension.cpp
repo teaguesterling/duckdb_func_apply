@@ -652,13 +652,94 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 // apply(func VARCHAR, ...args ANY) -> ANY
 //===--------------------------------------------------------------------===//
 
+//! Build a representative NON-NULL value of `type`, for use as a stand-in when
+//! probing what a macro body returns for a non-foldable argument.
+//!
+//! Why non-NULL matters: a macro body is probed by binding it against constant
+//! arguments, and that binding constant-folds. A *NULL* stand-in makes any
+//! NULL-propagating body fold to a SQLNULL constant -- `'GIT:' || NULL` has type
+//! "NULL", not VARCHAR -- and SQLNULL handed back as a scalar function's return
+//! type then materializes as INTEGER. That mis-typed `apply('clean_git', col)`
+//! as INTEGER and made it fail at run time casting 'GIT:a' to INT32.
+//!
+//! Magnitudes are deliberately small rather than `Value::MinimumValue(type)`:
+//! MinimumValue(INTEGER) is INT32_MIN, which makes an ordinary body like
+//! `x - 1` raise an overflow during folding and so look unbindable. MinimumValue
+//! is still the fallback for the types not spelled out here (temporals with no
+//! Numeric mapping, ENUM, ...); it throws for nested and other non-numeric
+//! types, so the call is guarded and failure just means "no probe available".
+static bool TryMakeProbeValue(const LogicalType &type, Value &out) {
+	switch (type.id()) {
+	case LogicalTypeId::INVALID:
+	case LogicalTypeId::SQLNULL:
+	case LogicalTypeId::UNKNOWN:
+	case LogicalTypeId::ANY:
+		// No concrete type to represent. (MinimumValue would answer INTEGER for
+		// SQLNULL, which is exactly the wrong guess.)
+		return false;
+	case LogicalTypeId::BOOLEAN:
+		out = Value::BOOLEAN(false);
+		return true;
+	case LogicalTypeId::VARCHAR:
+		out = Value(string());
+		return true;
+	case LogicalTypeId::BLOB:
+		out = Value::BLOB_RAW(string());
+		return true;
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		out = Value::Numeric(type, static_cast<int64_t>(1));
+		return true;
+	default:
+		break;
+	}
+	try {
+		auto candidate = Value::MinimumValue(type);
+		if (candidate.IsNull()) {
+			return false;
+		}
+		out = std::move(candidate);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+//! Outcome of trying to infer a candidate's return type.
+enum class InferOutcome : uint8_t {
+	//! A usable concrete return type was determined.
+	INFERRED,
+	//! The candidate cannot be bound against these arguments at all -- wrong
+	//! arity, or argument types it has no overload for. A genuine user error.
+	UNBINDABLE,
+	//! The candidate bound fine, but no usable type came back (the probe folded
+	//! to SQLNULL, or the function kind is not introspectable). Not an error:
+	//! the caller should keep its documented VARCHAR default.
+	INDETERMINATE
+};
+
 //! Infer what `func_name` returns when called with `arguments[first_arg_idx..]`.
 //! Handles both scalar functions (FunctionBinder) and macros (full expression
-//! binding against typed placeholders). Returns false when the return type
-//! cannot be determined, in which case the caller keeps its default.
-static bool TryInferCandidateReturnType(ClientContext &context, const string &func_name,
-                                        const vector<unique_ptr<Expression>> &arguments, idx_t first_arg_idx,
-                                        LogicalType &out) {
+//! binding against probe constants).
+//!
+//! The three-way outcome exists because "could not type it" and "cannot be
+//! called that way" need different handling: func_dispatch raises a bind error
+//! for the latter but must not for the former, or a valid macro whose body
+//! happens to fold to NULL (`nullif(x, '')`) would be rejected outright.
+static InferOutcome TryInferCandidateReturnType(ClientContext &context, const string &func_name,
+                                                const vector<unique_ptr<Expression>> &arguments, idx_t first_arg_idx,
+                                                LogicalType &out) {
 	auto func_type = GetCallableFunctionType(context, func_name);
 
 	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
@@ -671,10 +752,14 @@ static bool TryInferCandidateReturnType(ClientContext &context, const string &fu
 		auto bound_expr =
 		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(target_args), error);
 		if (error.HasError() || !bound_expr) {
-			return false;
+			return InferOutcome::UNBINDABLE;
 		}
-		out = CompatExprReturnType(*bound_expr);
-		return true;
+		auto &bound_type = CompatExprReturnType(*bound_expr);
+		if (bound_type.id() == LogicalTypeId::SQLNULL) {
+			return InferOutcome::INDETERMINATE;
+		}
+		out = bound_type;
+		return InferOutcome::INFERRED;
 	}
 
 	if (func_type == CatalogType::MACRO_ENTRY) {
@@ -684,24 +769,45 @@ static bool TryInferCandidateReturnType(ClientContext &context, const string &fu
 				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
 				parsed_args.push_back(CompatConstant(val));
 			} else {
-				// A typed NULL placeholder: Value(LogicalType) is a NULL of that type.
-				parsed_args.push_back(CompatConstant(Value(CompatExprReturnType(*arguments[i]))));
+				Value probe;
+				if (!TryMakeProbeValue(CompatExprReturnType(*arguments[i]), probe)) {
+					// Nothing better available: a typed NULL still exercises arity and
+					// overload resolution, and an SQLNULL result is caught below.
+					probe = Value(CompatExprReturnType(*arguments[i]));
+				}
+				parsed_args.push_back(CompatConstant(std::move(probe)));
 			}
 		}
 		unique_ptr<ParsedExpression> func_expr =
 		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
+		LogicalType bound_type;
 		try {
 			auto binder = Binder::CreateBinder(context);
+			// Keep SQLNULL observable. ExpressionBinder::Bind otherwise wraps an
+			// SQLNULL result in a cast to INTEGER ("SQL NULL type is only used
+			// internally in the binder"), so a body that folds to NULL comes back as a
+			// confident, wrong INTEGER and the check below could never fire --
+			// measured: bound_type=INTEGER for `'GIT:' || <NULL>`. Use the public
+			// setter: the underlying field is private on both lines and was renamed to
+			// legacy_can_contain_nulls in v2.0.
+			binder->SetCanContainNulls(true);
 			ConstantBinder constant_binder(*binder, context, "func_dispatch");
 			auto bound_expr = constant_binder.Bind(func_expr);
-			out = CompatExprReturnType(*bound_expr);
-			return true;
+			bound_type = CompatExprReturnType(*bound_expr);
 		} catch (...) {
-			return false;
+			return InferOutcome::UNBINDABLE;
 		}
+		if (bound_type.id() == LogicalTypeId::SQLNULL) {
+			// The probe folded the body away to an untyped NULL. Propagating that
+			// would surface as INTEGER; a wrong concrete type is worse than the
+			// documented VARCHAR fallback.
+			return InferOutcome::INDETERMINATE;
+		}
+		out = bound_type;
+		return InferOutcome::INFERRED;
 	}
 
-	return false;
+	return InferOutcome::INDETERMINATE;
 }
 
 static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
@@ -742,9 +848,11 @@ static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
 
 	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY || func_type == CatalogType::MACRO_ENTRY) {
 		LogicalType inferred;
-		if (TryInferCandidateReturnType(context, func_name, arguments, 1, inferred)) {
+		if (TryInferCandidateReturnType(context, func_name, arguments, 1, inferred) == InferOutcome::INFERRED) {
 			CompatBindSetReturnType(bound_function, inferred);
 		}
+		// UNBINDABLE and INDETERMINATE both keep the VARCHAR default: apply() has
+		// always deferred such calls to run time rather than failing at bind time.
 		return nullptr;
 	}
 
@@ -1004,6 +1112,26 @@ static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
 		return nullptr;
 	}
 
+	// Do not judge candidates when we do not know what will be forwarded to them.
+	//
+	// `CREATE MACRO normalize_name(filename) AS func_dispatch(..., filename)` --
+	// the documented wrapping pattern -- validates its body eagerly, and at that
+	// point `filename` is an unresolved parameter: measured as LogicalTypeId::UNKNOWN
+	// on v1.5.6. Binding every route against it fails for reasons that have nothing
+	// to do with the routes, so the arity check below would reject a correct macro at
+	// CREATE time. A bare `NULL` literal (LogicalTypeId::SQLNULL) carries no type
+	// either, and prepared-statement parameters (`?`) also arrive as UNKNOWN.
+	//
+	// When we cannot know what will be passed, we cannot meaningfully check whether a
+	// candidate accepts it, so judging is unsound; when we do know, a candidate that
+	// cannot accept the arguments is a genuine error worth failing loudly.
+	for (idx_t i = 2; i < arguments.size(); i++) {
+		auto arg_type_id = CompatExprReturnType(*arguments[i]).id();
+		if (arg_type_id == LogicalTypeId::UNKNOWN || arg_type_id == LogicalTypeId::SQLNULL) {
+			return nullptr;
+		}
+	}
+
 	LogicalType unified;
 	bool have_unified = false;
 
@@ -1027,7 +1155,8 @@ static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
 		}
 
 		LogicalType candidate_type;
-		if (!TryInferCandidateReturnType(context, candidate, arguments, 2, candidate_type)) {
+		auto outcome = TryInferCandidateReturnType(context, candidate, arguments, 2, candidate_type);
+		if (outcome == InferOutcome::UNBINDABLE) {
 			// Silently falling back to VARCHAR here produced a wrong VALUE, not merely
 			// a weaker type: len(func_dispatch(MAP{'a':'m_list1','b':'m_two'}, 'a', 7))
 			// returned 6 (the character count of the stringified '[7, 7]') instead of 2,
@@ -1039,6 +1168,13 @@ static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
 			                      "every route in a constant routing map must accept them "
 			                      "(or make the routing map non-constant to fall back to VARCHAR)",
 			                      candidate);
+		}
+		if (outcome == InferOutcome::INDETERMINATE) {
+			// The candidate is callable, we just could not type it. The unified type has
+			// to cover this route too, so the only honest answer for the whole call is
+			// the documented VARCHAR default -- not an error, and not a type derived
+			// from the routes we happened to be able to read.
+			return nullptr;
 		}
 
 		if (!have_unified) {

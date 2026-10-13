@@ -483,6 +483,33 @@ SELECT typeof(apply('m_double', 21));
 ----
 INTEGER
 
+# A `||`-bodied macro with a NON-FOLDABLE argument. This is the pre-existing
+# path that used to mis-infer INTEGER: the macro branch probed the body with a
+# typed NULL stand-in, `'GIT:' || NULL` constant-folds to SQLNULL, and the
+# binder's "SQL NULL type is only used internally" rule then cast that to
+# INTEGER. apply() reported INTEGER and the call died at run time with
+# "Could not convert string 'GIT:a' to INT32". Both assertions are needed: the
+# value one fails under the INTEGER mis-inference, the typeof one pins the
+# cause rather than the symptom.
+statement ok
+CREATE MACRO m_cat_prefix(p) AS 'GIT:' || p;
+
+query I
+SELECT typeof(apply('m_cat_prefix', u)) FROM (VALUES ('a')) t(u);
+----
+VARCHAR
+
+query I
+SELECT apply('m_cat_prefix', u) FROM (VALUES ('a')) t(u);
+----
+GIT:a
+
+# A NULL argument must not resurrect the SQLNULL -> INTEGER path either.
+query I
+SELECT typeof(apply('m_cat_prefix', NULL::VARCHAR));
+----
+VARCHAR
+
 # --- Nested apply calls ---
 
 query I
