@@ -189,17 +189,28 @@ flipped expectation cannot mask the rest.
 
 ## Risks
 
-1. **~~Type promotion may surprise~~ — MEASURED FALSE, 2026-10-13.** The spec
-   predicted `INTEGER + VARCHAR -> VARCHAR`, silently stringifying the integer
-   branch. DuckDB does not do this: there is no implicit cast between a real
-   (non-literal) INTEGER and VARCHAR, so such a routing map raises a
-   `BinderException` instead. Measured via CASE, which unifies through the same
-   path: `CASE WHEN true THEN i ELSE s END` over an INTEGER and a VARCHAR column
-   gives `Cannot mix values of type VARCHAR and INTEGER`. Only widening pairs
-   unify (`INTEGER + BIGINT -> BIGINT`, confirmed). The practical effect is the
-   stricter "require agreement" behavior, obtained for free from DuckDB's cast
-   rules rather than enforced by us. An INTEGER literal DOES absorb into
-   VARCHAR's side, so a literal-only map can still promote.
+1. **An unbindable candidate silently degrades the whole call to VARCHAR.**
+   Step 3 above falls back to VARCHAR when any candidate cannot be bound against the
+   forwarded arguments, rather than reporting a type only some branches satisfy. The
+   consequence, not thought through when that choice was made: a routing map whose
+   candidates have **differing arities** can never be typed at all, and the arity
+   error surfaces only at run time. Measured 2x2 on 2026-10-13, dispatching one
+   forwarded argument against a VARCHAR partner macro:
+
+   |              | arity matches                     | arity mismatch |
+   |--------------|-----------------------------------|----------------|
+   | literal body | `BinderException` cannot unify    | VARCHAR        |
+   | typed body   | `BinderException` cannot unify    | VARCHAR        |
+
+   Arity is the whole mechanism; the body's literal-ness is irrelevant. Two earlier
+   readings of this spec (mine, and a reviewer's) attributed the VARCHAR to literal
+   absorption because their repros varied body-type and arity together. Pinned by a
+   discriminating test pair in `test/sql/func_dispatch_typing.test`.
+
+   Earlier revisions of this spec claimed `INTEGER + VARCHAR -> VARCHAR` promotion
+   (wrong), then that such a pair "does not unify at all" (right for concretely-typed
+   candidates of matching arity, which is the only case that reaches unification).
+
 2. **Bind-time binding of every candidate costs plan time** proportional to map
    size. Fine for routing tables of a handful of entries; a thousand-entry map
    would be slow to plan.
