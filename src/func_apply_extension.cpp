@@ -926,6 +926,95 @@ static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &
 }
 
 //===--------------------------------------------------------------------===//
+// func_dispatch(routes MAP(VARCHAR,VARCHAR), key VARCHAR, ...args ANY) -> ANY
+//===--------------------------------------------------------------------===//
+
+//! Routing-table key whose value is used when the dispatch key is absent.
+//! A literal '*' therefore cannot be a dispatch key; documented in docs/limitations.md.
+static constexpr const char *FUNC_DISPATCH_WILDCARD = "*";
+
+//! Resolve `key` against a MAP value, falling back to FUNC_DISPATCH_WILDCARD.
+//! Returns false when nothing matched (caller yields NULL).
+static bool LookupRoute(const Value &routes, const string &key, string &out_name) {
+	if (routes.IsNull()) {
+		return false;
+	}
+	auto &entries = MapValue::GetChildren(routes);
+	string wildcard_name;
+	bool have_wildcard = false;
+	for (auto &entry : entries) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv[0].IsNull() || kv[1].IsNull()) {
+			continue;
+		}
+		auto entry_key = StringValue::Get(kv[0]);
+		if (entry_key == key) {
+			out_name = StringValue::Get(kv[1]);
+			return true;
+		}
+		if (entry_key == FUNC_DISPATCH_WILDCARD) {
+			wildcard_name = StringValue::Get(kv[1]);
+			have_wildcard = true;
+		}
+	}
+	if (have_wildcard) {
+		out_name = wildcard_name;
+		return true;
+	}
+	return false;
+}
+
+static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
+#ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
+	auto &context = bind_input.GetClientContext();
+	auto &arguments = bind_input.GetArguments();
+	auto &bound_function = bind_input.GetBoundFunction();
+#endif
+	(void)context;
+	CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
+	if (arguments.size() < 2) {
+		throw BinderException("func_dispatch requires a routing map and a key");
+	}
+	return nullptr;
+}
+
+static void FuncDispatchScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	idx_t count = args.size();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto routes = args.data[0].GetValue(i);
+		auto key_val = args.data[1].GetValue(i);
+		if (routes.IsNull() || key_val.IsNull()) {
+			result.SetValue(i, Value());
+			continue;
+		}
+
+		string func_name;
+		if (!LookupRoute(routes, StringValue::Get(key_val), func_name)) {
+			result.SetValue(i, Value());
+			continue;
+		}
+
+		if (!IsValidIdentifier(func_name)) {
+			throw InvalidInputException("func_dispatch: invalid function name '%s'", func_name);
+		}
+
+		vector<Value> func_args;
+		for (idx_t j = 2; j < args.ColumnCount(); j++) {
+			func_args.push_back(args.data[j].GetValue(i));
+		}
+
+		try {
+			result.SetValue(i, ExecuteFunction(context, func_name, func_args));
+		} catch (const Exception &e) {
+			throw InvalidInputException("func_dispatch('%s'): %s", func_name, e.what());
+		}
+	}
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+}
+
+//===--------------------------------------------------------------------===//
 // apply_table(func VARCHAR, ...args ANY) -> TABLE
 //===--------------------------------------------------------------------===//
 
@@ -1420,6 +1509,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(std::move(info));
 	}
+
+	// Register func_dispatch (map-driven dispatch, variadic forwarded args)
+	auto func_dispatch_func = ScalarFunction("func_dispatch",
+	                                         {LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+	                                          LogicalType::VARCHAR},
+	                                         LogicalType::ANY, FuncDispatchScalarFun, BindFuncDispatch);
+	CompatSetScalarVarArgs(func_dispatch_func, LogicalType::ANY);
+	CompatSetScalarNullHandling(func_dispatch_func, FunctionNullHandling::SPECIAL_HANDLING);
+	// Forwarded arguments may be aliased (func_dispatch(m, k, x, b := 'y')). v2.0
+	// defaults alias capture OFF, and without this the aliases arrive empty and every
+	// named argument is silently treated as positional -- runtime breakage, green build.
+	CompatSetCaptureArgumentAliases(func_dispatch_func);
+	func_dispatch_func.SetFallible();
+	loader.RegisterFunction(func_dispatch_func);
 
 	// Register apply_table (table function with variadic args)
 	// Uses bind_replace to generate SQL dynamically

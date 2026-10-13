@@ -1,0 +1,94 @@
+# name: test/sql/func_dispatch.test
+# description: func_dispatch map-driven dynamic dispatch
+# group: [sql]
+
+require func_apply
+
+statement ok
+CREATE MACRO route_git(p) AS 'GIT:' || p;
+
+statement ok
+CREATE MACRO route_http(p) AS 'HTTP:' || p;
+
+statement ok
+CREATE MACRO route_any(p) AS 'ANY:' || p;
+
+# --- happy path: both branches of a two-entry table ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, 'git', 'a.git');
+----
+GIT:a.git
+
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, 'https', 'b');
+----
+HTTP:b
+
+# --- miss -> NULL ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git'}, 's3', 'x') IS NULL;
+----
+true
+
+# --- NULL key -> NULL ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git'}, NULL, 'x') IS NULL;
+----
+true
+
+# --- empty map -> NULL ---
+query I
+SELECT func_dispatch(MAP{}::MAP(VARCHAR,VARCHAR), 'git', 'x') IS NULL;
+----
+true
+
+# --- '*' wildcard fallback on a miss ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', '*': 'route_any'}, 's3', 'x');
+----
+ANY:x
+
+# --- an exact hit beats the wildcard ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', '*': 'route_any'}, 'git', 'x');
+----
+GIT:x
+
+# --- per-row dispatch from a column ---
+query II
+SELECT k, func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, k, 'v')
+FROM (VALUES ('git'), ('https')) t(k) ORDER BY k;
+----
+git	GIT:v
+https	HTTP:v
+
+# --- positional arg forwarding (multi-arg target) ---
+statement ok
+CREATE MACRO route_two(a, b) AS 'TWO:' || a || '/' || b;
+
+query I
+SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', 'x', 'y');
+----
+TWO:x/y
+
+# --- aliased arg forwarding, as apply() does ---
+query I
+SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', 'x', b := 'y');
+----
+TWO:x/y
+
+# --- errors ---
+statement error
+SELECT func_dispatch(MAP{'git': 'no_such_function_xyz'}, 'git', 'x');
+----
+does not exist
+
+statement error
+SELECT func_dispatch(MAP{'git': 'duckdb_functions'}, 'git', 1);
+----
+apply_table
+
+statement error
+SELECT func_dispatch(MAP{'git': 'route_git'});
+----
+No function matches
