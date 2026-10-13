@@ -77,11 +77,29 @@ SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', 'x', 'y');
 ----
 TWO:x/y
 
-# --- aliased arg forwarding, as apply() does ---
+# --- alias names are IGNORED: forwarding is purely positional ---
+# Measured: this is NOT TWO:x/y. 'y' is forwarded to a (1st forwarded
+# position) and 'x' to b (2nd forwarded position), regardless of the
+# b := / a := labels -- proving aliases are accepted but discarded, and
+# the value lands by position alone, the same way apply() forwards args.
 query I
-SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', 'x', b := 'y');
+SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', b := 'y', a := 'x');
 ----
-TWO:x/y
+TWO:y/x
+
+# --- NULL forwarding is not short-circuited ---
+# Pins the SPECIAL_HANDLING null-handling flag: without it, DuckDB would
+# auto-propagate a NULL forwarded argument to a NULL result before the
+# function ever runs. m_coalesce_null returns a non-NULL value for a NULL
+# input, so a short-circuited (auto-NULLed) call would wrongly return NULL
+# and this assertion would catch it.
+statement ok
+CREATE MACRO m_coalesce_null(x) AS COALESCE(x, 'MISSING');
+
+query I
+SELECT func_dispatch(MAP{'k': 'm_coalesce_null'}, 'k', NULL);
+----
+MISSING
 
 # --- errors ---
 statement error

@@ -92,17 +92,16 @@ SELECT func_dispatch(MAP{'a': 'm_int', 'b': 'm_str'}, 'a', 41);
 ----
 cannot be unified
 
-# --- a candidate that can't be bound against the forwarded arguments
-# silently drops the WHOLE call to VARCHAR, regardless of what any other
-# candidate's return type is ---
+# --- a candidate that can't be bound against the forwarded arguments is a
+# bind error for the WHOLE call, regardless of what any other candidate's
+# return type is ---
 #
-# m_zero_arg_lit takes no parameters and its body is the bare literal 5
-# (INTEGER alone -- asserted below). m_one_arg_str takes one parameter and
-# casts it to VARCHAR. Dispatching with ZERO forwarded arguments means
-# m_one_arg_str's declared arity (1) doesn't match the call, so
-# TryInferCandidateReturnType can't bind it at all -- not a type mismatch,
-# an arity mismatch -- and BindFuncDispatch gives up on the whole call and
-# falls back to VARCHAR, exactly as the non-constant-routes path does.
+# This used to be a silent VARCHAR fallback that produced a wrong VALUE, not
+# merely a weaker type: with a constant routing map,
+# func_dispatch(MAP{'a': 'm_zero_arg_lit', 'b': 'm_one_arg_str'}, 'a') bound
+# the whole call to VARCHAR and returned the STRING '5' instead of the
+# INTEGER 5 that m_zero_arg_lit actually produces -- precisely the defect
+# func_dispatch exists to fix. It is now a bind error instead.
 statement ok
 CREATE MACRO m_zero_arg_lit() AS 5;
 
@@ -114,29 +113,31 @@ SELECT typeof(func_dispatch(MAP{'a': 'm_zero_arg_lit'}, 'a'));
 ----
 INTEGER
 
-query I
-SELECT typeof(func_dispatch(MAP{'a': 'm_zero_arg_lit', 'b': 'm_one_arg_str'}, 'a'));
-----
-VARCHAR
-
-# the actual target (m_zero_arg_lit) really does return the INTEGER 5; the
-# bound VARCHAR return type silently casts it to the string '5', the exact
-# defect func_dispatch exists to prevent, surfacing from a fully constant
-# routing map.
-query I
+statement error
 SELECT func_dispatch(MAP{'a': 'm_zero_arg_lit', 'b': 'm_one_arg_str'}, 'a');
 ----
-5
+cannot be called with the forwarded arguments
 
-# --- discriminator: a bare literal gets NO special unification treatment.
-# Pin matching arities (one forwarded argument to two one-argument macros,
-# the INTEGER side's body a bare literal that ignores its argument) and
-# confirm the unify-failure bind error still fires -- proving the VARCHAR
-# fallback above is caused by the arity mismatch, not by "a literal return
-# value is more permissive about implicit casts."
+# --- the discriminating pair: same routing map and key, differing ONLY in
+# forwarded-argument count, to prove which failure mode fires on which side.
+#
+# m_lit_matched_arity(x) and m_str(x) both declare exactly one parameter.
+# Forward ZERO arguments: neither candidate's declared arity (1) matches the
+# call, so TryInferCandidateReturnType can't bind EITHER of them -- an arity
+# mismatch, same mechanism as the pair above -- and the call is a bind error.
 statement ok
 CREATE MACRO m_lit_matched_arity(x) AS 5;
 
+statement error
+SELECT func_dispatch(MAP{'a': 'm_lit_matched_arity', 'b': 'm_str'}, 'a');
+----
+cannot be called with the forwarded arguments
+
+# Forward ONE argument (41): arities now match for both candidates, so both
+# bind successfully -- proving the bind error above was caused by the arity
+# mismatch, not by "a literal return value is more permissive about implicit
+# casts." With arities satisfied, the real return types (INTEGER vs VARCHAR)
+# fail to unify instead -- a different bind error.
 query I
 SELECT typeof(func_dispatch(MAP{'a': 'm_lit_matched_arity'}, 'a', 41));
 ----
