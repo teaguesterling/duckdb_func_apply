@@ -374,17 +374,25 @@ CREATE MACRO clean_git(p)   AS regexp_replace(p, '^git://', '');
 CREATE MACRO clean_http(p)  AS regexp_replace(p, '^https?://', '');
 CREATE MACRO clean_other(p) AS p;
 
-CREATE MACRO normalize_name(filename) AS
-  func_dispatch(MAP{'git':   'clean_git',
-                    'http':  'clean_http',
-                    'https': 'clean_http',
-                    '*':     'clean_other'},
-                urlpattern_protocol(filename),
-                filename);
-
-SELECT u, normalize_name(u) AS cleaned
+SELECT u,
+       func_dispatch(MAP{'git':   'clean_git',
+                         'http':  'clean_http',
+                         'https': 'clean_http',
+                         '*':     'clean_other'},
+                     urlpattern_protocol(u),
+                     u) AS cleaned
 FROM (VALUES ('git://host/a.git'), ('https://host/b'), ('s3://bucket/c')) t(u);
 ```
 
 The `'*'` entry catches every scheme the table does not name, so an unknown
 scheme passes through instead of becoming `NULL`.
+
+**Call `func_dispatch` directly; don't wrap it in a convenience macro that
+forwards the wrapping macro's own parameter.** A macro's body is validated
+against its own (not-yet-resolved) parameters when the macro is *created*,
+before any real call site exists. With a constant routing map, that
+validation pass hits the same per-candidate check fix 1 made loud: the
+forwarding macro's own parameter isn't a concrete type yet, so `CREATE
+MACRO normalize_name(filename) AS func_dispatch(MAP{...}, ..., filename)`
+now fails at `CREATE MACRO` time, even though every real call site (as
+above) binds correctly. See [Limitations](limitations.md).

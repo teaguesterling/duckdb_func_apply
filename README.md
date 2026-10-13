@@ -59,8 +59,13 @@ SELECT apply('round', 3.14159, 2);        -- 3.14
 SELECT apply('list_sum', [1, 2, 3, 4]);   -- 10
 SELECT apply('list_reverse', [1, 2, 3]); -- [3, 2, 1]
 
--- Named parameters are supported
+-- Named arguments are ACCEPTED, but forwarding is purely positional: the
+-- alias names are ignored, and args are matched by position alone. This
+-- example "works" only because start:=7, length:=5 happens to match
+-- substr's declared positional order (string, start, length):
 SELECT apply('substr', 'hello world', start := 7, length := 5);  -- world
+-- Reorder the aliases and the result reorders too, proving it:
+SELECT apply('substr', 'hello world', length := 5, start := 7);  -- o world
 ```
 
 ### `apply_with(func_name, args, kwargs)`
@@ -92,16 +97,24 @@ Dispatches to the function named by `routes[key]`, forwarding `...args`.
 ```sql
 LOAD urlpattern;
 
-CREATE MACRO get_git_object_path(p) AS 'GIT:' || regexp_replace(p, '^git://', '');
-CREATE MACRO get_http_path(p) AS 'HTTP:' || p;
+CREATE MACRO get_git_object_path(p) AS regexp_replace(p, '^git://', 'GIT:');
+CREATE MACRO get_http_path(p) AS regexp_replace(p, '^https?://', 'HTTP:');
 
-CREATE MACRO normalize_name(filename) AS
-  func_dispatch(MAP{'git': 'get_git_object_path', 'https': 'get_http_path'},
-                urlpattern_protocol(filename),
-                filename);
-
-SELECT normalize_name('git://host/a/b.git');  -- GIT:host/a/b.git
+SELECT func_dispatch(MAP{'git': 'get_git_object_path', 'https': 'get_http_path'},
+                      urlpattern_protocol(filename),
+                      filename) AS cleaned
+FROM (VALUES ('git://host/a/b.git')) t(filename);
+-- Result: GIT:host/a/b.git
 ```
+
+**Call `func_dispatch` directly rather than wrapping it in a convenience
+macro that forwards the wrapping macro's own parameter** (e.g. `CREATE MACRO
+normalize_name(filename) AS func_dispatch(MAP{...}, ..., filename)`). A
+macro's body is validated against its own not-yet-resolved parameters when
+the macro is *created*; with a constant routing map that validation hits the
+same per-candidate check as a real call, and the parameter isn't a concrete
+type yet, so the `CREATE MACRO` itself fails even though every real call
+site binds correctly. See [Limitations](docs/limitations.md).
 
 Unlike `apply()` with a dynamic name, `func_dispatch` binds every function in
 the routing map at plan time, so the result keeps its **real type**:

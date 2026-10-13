@@ -406,6 +406,142 @@ SELECT function_exists(NULL);
 
 ---
 
+## func_dispatch
+
+Dispatches to the function named by `routes[key]`, forwarding the remaining
+arguments, with its real return type resolved at bind time.
+
+### Signature
+
+```sql
+func_dispatch(routes MAP(VARCHAR, VARCHAR), key VARCHAR, ...args ANY) -> ANY
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `routes` | `MAP(VARCHAR, VARCHAR)` | Maps a key to the name of the function or macro to call. `'*'` is used as a fallback when `key` is absent. |
+| `key` | `VARCHAR` | Looked up in `routes` to choose which function to call. |
+| `...args` | `ANY` | Forwarded positionally to the resolved function. |
+
+### Returns
+
+When `routes` is a compile-time constant, every candidate route is bound at
+plan time against the forwarded arguments, and the candidates' return types
+are unified with DuckDB's normal type promotion (e.g. `INTEGER` and `BIGINT`
+unify to `BIGINT`); that unified type becomes the function's real return
+type — unlike `apply()` with a dynamic function name, which always collapses
+to `VARCHAR`. When `routes` is not a constant, the return type is `VARCHAR`,
+the same as `apply()`.
+
+### Description
+
+`func_dispatch()` resolves `routes[key]` to a scalar function or macro name
+and calls it with `...args`. An exact match on `key` always wins; `'*'` is
+used only when `key` is absent from `routes`. It returns `NULL` when neither
+matches, when `key` is `NULL`, or when `routes` is `NULL` or empty.
+
+This exists to fix the type collapse `apply()` suffers with a dynamic
+function name: because `func_dispatch` can see every candidate name when
+`routes` is constant, it binds all of them against the real argument types
+and reports the real unified return type instead of defaulting to `VARCHAR`.
+
+**Every candidate must accept the forwarded arguments.** With a constant
+routing map, each candidate is bound against `...args`. If any candidate's
+declared parameters don't match — wrong arity, or an argument with no cast to
+the declared parameter type — the call is a bind error naming that candidate
+(see Errors below), even if every other candidate agrees on a return type. A
+routing map should dispatch only to functions that all accept the arguments
+the call forwards and agree on a return type.
+
+Arguments are forwarded **positionally only**. A named argument like
+`b := 'y'` is accepted, but its alias is ignored — the value is still
+matched by its position among `...args`, not by the name `b`.
+
+### Examples
+
+**Basic usage:**
+
+```sql
+CREATE MACRO route_git(p) AS 'GIT:' || p;
+CREATE MACRO route_http(p) AS 'HTTP:' || p;
+
+SELECT func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, 'git', 'a.git');
+-- Result: GIT:a.git
+```
+
+**`'*'` wildcard fallback:**
+
+```sql
+CREATE MACRO route_any(p) AS 'ANY:' || p;
+
+SELECT func_dispatch(MAP{'git': 'route_git', '*': 'route_any'}, 's3', 'x');
+-- Result: ANY:x
+```
+
+**Real return type, unlike `apply()` with a dynamic name:**
+
+```sql
+CREATE MACRO pair(x) AS [x, x];
+
+-- apply() with a dynamic name returns the STRING '[7, 7]':
+SELECT typeof(apply(MAP{'a': 'pair'}[k], 7)) FROM (VALUES ('a')) t(k);
+-- Result: VARCHAR
+
+-- func_dispatch returns a real list:
+SELECT typeof(func_dispatch(MAP{'a': 'pair'}, 'a', 7));
+-- Result: INTEGER[]
+SELECT len(func_dispatch(MAP{'a': 'pair'}, 'a', 7));
+-- Result: 2
+```
+
+**Miss and NULL handling:**
+
+```sql
+SELECT func_dispatch(MAP{'git': 'route_git'}, 's3', 'x') IS NULL;
+-- Result: true
+
+SELECT func_dispatch(MAP{'git': 'route_git'}, NULL, 'x') IS NULL;
+-- Result: true
+```
+
+**Positional forwarding only:**
+
+```sql
+CREATE MACRO route_two(a, b) AS 'TWO:' || a || '/' || b;
+
+-- Alias names are ignored; 'y' is forwarded to a (1st position) and
+-- 'x' to b (2nd position), REGARDLESS of the b := / a := labels:
+SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', b := 'y', a := 'x');
+-- Result: TWO:y/x
+```
+
+### Errors
+
+| Error | Cause |
+|-------|-------|
+| `routing map has a NULL function name` | A value in `routes` is `NULL` |
+| `invalid function name` | A route name contains invalid characters |
+| `function '...' does not exist` | A route name does not resolve to any function |
+| `is a table function` | A route name resolves to a table function (use `apply_table()` instead) |
+| `candidate return types ... cannot be unified` | Two candidates from a constant routing map resolve to incompatible return types |
+| `candidate '...' cannot be called with the forwarded arguments` | A candidate's declared parameters don't accept `...args` (wrong arity, or no cast to the declared type) |
+
+**Run-time errors:** whatever the resolved function raises, plus the session
+security policy, which applies to every candidate including `'*'`.
+
+### Limitations
+
+- `'*'` participates in exact-key matching like any other route, but it also
+  serves as the fallback, so it cannot be routed anywhere *different* from
+  the fallback. See [Limitations](limitations.md).
+- A constant routing map requires every candidate to accept the forwarded
+  arguments; a route that can't is a bind error, not a silent fallback. See
+  [Limitations](limitations.md).
+
+---
+
 ## Type Inference
 
 When the function name is a compile-time constant, FuncApply infers the return type from the target function:
@@ -426,6 +562,18 @@ When the function name is dynamic (from a column), the return type defaults to `
 ```sql
 SELECT typeof(apply(func_col, 'hello')) FROM ...;
 -- Result: VARCHAR (default)
+```
+
+[`func_dispatch()`](#func_dispatch) removes this dynamic-name restriction when
+its routing map is a compile-time constant: it binds every candidate function
+against the forwarded arguments and reports their unified return type, instead
+of defaulting to `VARCHAR`. That only holds when every candidate accepts the
+forwarded arguments — see [`func_dispatch`](#func_dispatch) and
+[Limitations](limitations.md) for the bind-error case where one doesn't.
+
+```sql
+SELECT typeof(func_dispatch(MAP{'a': 'length'}, 'a', 'hello'));
+-- Result: BIGINT
 ```
 
 ---
@@ -571,6 +719,16 @@ Sets the default value returned when `on_block` is `'default'`.
 func_apply_set_block_default(value ANY) -> VARCHAR
 ```
 
+**Non-VARCHAR return types.** `func_dispatch()` makes non-`VARCHAR` return
+types normal (see [`func_dispatch`](#func_dispatch)), and `on_block = 'default'`
+casts `block_default` to whatever return type the call was bound to. If the
+configured default has no cast to that type, a blocked call fails instead of
+returning the default — measured: with `block_default = 'FALLBACK'` and a
+route bound to `INTEGER`, a blocked call raises
+`Could not convert string 'FALLBACK' to INT32` rather than returning
+`'FALLBACK'`. Set a `block_default` that casts to every bound return type the
+routing map can produce, or use `on_block = 'null'` instead.
+
 ### func_apply_lock_security
 
 Locks the security configuration, preventing any further changes. **This is irreversible for the session.**
@@ -643,42 +801,3 @@ SELECT func_apply_lock_security();
 SELECT apply(user_func, user_data) FROM user_requests;
 -- Only whitelisted functions work; others return 'ACCESS_DENIED'
 ```
-
-## `func_dispatch(routes, key, ...args)`
-
-**Signature:** `func_dispatch(MAP(VARCHAR, VARCHAR), VARCHAR, ...ANY) -> ANY`
-
-Resolves `routes[key]` to a scalar function or macro name and calls it with
-`...args`. Falls back to the `'*'` entry when `key` is absent; returns `NULL`
-when neither matches, when `key` is `NULL`, or when `routes` is `NULL` or empty.
-
-**Return type.** When `routes` is a constant, every candidate is bound at plan
-time against the forwarded arguments, and the return types are unified with
-DuckDB's normal type promotion; that unified type is the function's return
-type. Promotion only applies where an implicit cast exists: `INTEGER` and
-`BIGINT` unify to `BIGINT`; `INTEGER` and `VARCHAR` (like `LIST` and `STRUCT`)
-have no common type and raise a bind error — this holds even when one
-candidate's body is a bare literal, so a literal return value gets no special
-treatment.
-
-A candidate is only unified, though, if it can be bound at all against the
-forwarded arguments. If any candidate's declared parameters don't match what
-the call forwards — wrong arity, or an argument with no cast to the declared
-parameter type — that candidate can't be type-checked, and the **whole call**
-silently falls back to `VARCHAR`, exactly as if `routes` were not a constant,
-regardless of what every other candidate agreed on. That mismatched
-candidate's arity is then only caught if it is actually invoked at run time,
-where it raises an unrelated-looking runtime error rather than a bind error.
-In practice a routing map should dispatch to functions that both agree on a
-return type and all accept the arguments the call site forwards. When
-`routes` is not a constant the return type is `VARCHAR`, as with `apply()`.
-
-**Bind-time errors:** a candidate that does not exist, is a table function, has
-a non-identifier name, or is `NULL`; and candidates whose return types cannot be
-unified.
-
-**Run-time errors:** whatever the target raises, plus the session security
-policy, which applies to every candidate including `'*'`.
-
-Arguments are forwarded positionally and by alias, the same way `apply()`
-forwards them: `func_dispatch(m, k, 'hello world', start := 7)`.

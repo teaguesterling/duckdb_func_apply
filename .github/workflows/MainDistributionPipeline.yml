@@ -38,8 +38,13 @@ jobs:
 
   # Real v2.0 leg (distinct from the advisory main canary above). This builds the
   # line the community registry ships as the prerelease (build_next.yml =
-  # v2.0-cyanoptera), and unlike the main canary its `if:` INCLUDES pull_request, so
-  # it GATES PRs.
+  # v2.0-cyanoptera). Its `if:` (below) is byte-identical to the advisory main
+  # canary's: workflow_dispatch, or push to main. It does NOT include pull_request,
+  # so like the canary it does NOT gate PRs -- it only runs on manual dispatch or a
+  # push to main, and is advisory, same as the canary above. (Commit fb00280
+  # deliberately dropped pull_request from this leg's `if:` and left this comment
+  # claiming otherwise -- two separate reviews treated the stale comment as ground
+  # truth and concluded this leg gated PRs when it never ran on them.)
   #
   # It exists because this repo's varargs shim was broken on cyanoptera for a release
   # and CI could not see it: the shim's "modern" branch called SetVarArgs, which
