@@ -128,11 +128,16 @@ The `'*'` candidate participates in return-type unification like any other.
 
 ## Security
 
-Candidate names are validated through the existing per-session policy
-(`ValidateFunctionCall` / `GetBlockedValue`) at **both** bind time and run time.
-Bind-time checks are an early-failure convenience only; the run-time check is
-authoritative, because the routing table may not be foldable and the policy can
-change between plan and execution.
+Security policy is enforced at **run time only**, through the existing
+`ExecuteFunction` -> `ValidateFunctionCall` / `GetBlockedValue` path, exactly as
+`apply` does.
+
+Bind time deliberately does NOT consult the policy. Checking it there would turn
+`func_apply_set_on_block('null')` and `('default')` into hard `BinderException`s,
+contradicting the behavior the user configured; and the policy can change between
+plan and execution, so a bind-time verdict is not authoritative anyway. Bind-time
+errors are therefore limited to: name validity, name existence, wrong function
+kind, and return-type unification.
 
 `func_dispatch` introduces no new identifier interpolation. Unlike
 `apply_table_with`, it builds no SQL text, so the injection class behind
