@@ -54,6 +54,12 @@ SELECT func_dispatch(MAP{'git': 'route_git', '*': 'route_any'}, 'git', 'x');
 ----
 GIT:x
 
+# the exact key wins even when '*' is written first in the map literal
+query I
+SELECT func_dispatch(MAP{'*': 'route_any', 'git': 'route_git'}, 'git', 'x');
+----
+GIT:x
+
 # --- per-row dispatch from a column ---
 query II
 SELECT k, func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, k, 'v')
