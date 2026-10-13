@@ -643,3 +643,29 @@ SELECT func_apply_lock_security();
 SELECT apply(user_func, user_data) FROM user_requests;
 -- Only whitelisted functions work; others return 'ACCESS_DENIED'
 ```
+
+## `func_dispatch(routes, key, ...args)`
+
+**Signature:** `func_dispatch(MAP(VARCHAR, VARCHAR), VARCHAR, ...ANY) -> ANY`
+
+Resolves `routes[key]` to a scalar function or macro name and calls it with
+`...args`. Falls back to the `'*'` entry when `key` is absent; returns `NULL`
+when neither matches, when `key` is `NULL`, or when `routes` is `NULL` or empty.
+
+**Return type.** When `routes` is a constant, every candidate is bound at plan
+time and the return types are unified with DuckDB's normal type promotion; that
+unified type is the function's return type. Promotion only applies where an
+implicit cast exists: `INTEGER` and `BIGINT` unify to `BIGINT`, but `INTEGER` and
+`VARCHAR` do not unify at all and raise a bind error. In practice a routing map
+should dispatch to functions that agree on a return type. When `routes` is not a constant the
+return type is `VARCHAR`, as with `apply()`.
+
+**Bind-time errors:** a candidate that does not exist, is a table function, has
+a non-identifier name, or is `NULL`; and candidates whose return types cannot be
+unified.
+
+**Run-time errors:** whatever the target raises, plus the session security
+policy, which applies to every candidate including `'*'`.
+
+Arguments are forwarded positionally and by alias, the same way `apply()`
+forwards them: `func_dispatch(m, k, 'hello world', start := 7)`.

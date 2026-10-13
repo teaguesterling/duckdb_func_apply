@@ -10,6 +10,7 @@ The FuncApply extension provides dynamic function invocation capabilities for Du
 - Pass arguments dynamically using `apply_with()`
 - Call table functions dynamically using `apply_table()` and `apply_table_with()`
 - Check if functions exist with `function_exists()`
+- Route a value to one of several functions with `func_dispatch()`
 
 This is useful for data-driven transformations, dynamic SQL generation, and building flexible data pipelines.
 
@@ -83,6 +84,56 @@ for forward compatibility, but passing a non-empty struct raises
 `kwargs (named parameters) are not yet supported`. Use `apply()` with named
 arguments (`apply('substr', s, start := 7, length := 5)`) for scalar named
 parameters. (`apply_table_with` *does* support `kwargs` — see below.)
+
+### `func_dispatch(routes, key, ...args)`
+
+Dispatches to the function named by `routes[key]`, forwarding `...args`.
+
+```sql
+CREATE MACRO get_git_object_path(p) AS 'GIT:' || regexp_replace(p, '^git://', '');
+CREATE MACRO get_http_path(p) AS 'HTTP:' || p;
+
+CREATE MACRO normalize_name(filename) AS
+  func_dispatch(MAP{'git': 'get_git_object_path', 'https': 'get_http_path'},
+                urlpattern_protocol(filename),
+                filename);
+
+SELECT normalize_name('git://host/a/b.git');  -- GIT:host/a/b.git
+```
+
+Unlike `apply()` with a dynamic name, `func_dispatch` binds every function in
+the routing map at plan time, so the result keeps its **real type**:
+
+```sql
+CREATE MACRO pair(x) AS [x, x];
+
+-- apply() with a dynamic name returns the STRING '[7, 7]':
+SELECT typeof(apply(MAP{'a':'pair'}[k], 7)) FROM (VALUES ('a')) t(k);  -- VARCHAR
+
+-- func_dispatch returns a real list:
+SELECT typeof(func_dispatch(MAP{'a':'pair'}, 'a', 7));                 -- INTEGER[]
+```
+
+| behavior | result |
+|----------|--------|
+| `key` missing from `routes` | `NULL` |
+| `key` is `NULL` | `NULL` |
+| `routes` contains a `'*'` entry | used when `key` is missing |
+| candidates return different types | unified where an implicit cast exists (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error otherwise, which includes `INTEGER`+`VARCHAR` |
+| `routes` is not a constant | works, but the return type falls back to `VARCHAR` |
+
+**Watch the key extractor.** The map key must match exactly what the extractor
+produces. For a URL these differ:
+
+| expression | value for `git://host/x` |
+|------------|--------------------------|
+| `urlpattern_protocol(p)` | `git` |
+| `url_parse(p).protocol` | `git:` |
+
+A key of `'git://'` matches neither and silently returns `NULL`.
+
+The routing map is checked against the session [security policy](#security-model)
+at run time, including the `'*'` entry.
 
 ### `apply_table(func_name, ...args)`
 

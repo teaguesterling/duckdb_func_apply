@@ -57,6 +57,21 @@ SELECT typeof(apply('length', 'hello'));  -- BIGINT
 SELECT typeof(apply(func_col, 'hello')) FROM funcs;  -- VARCHAR
 ```
 
+`func_dispatch()` removes this restriction when the routing map is a constant,
+because it can bind every candidate at plan time:
+
+```sql
+SELECT typeof(func_dispatch(MAP{'a': 'length'}, 'a', 'hello'));  -- BIGINT
+```
+
+A routing map that is itself non-constant still falls back to `VARCHAR`.
+
+### `'*'` cannot be a dispatch key
+
+`func_dispatch()` reserves the map key `'*'` for the fallback route, so a literal
+`'*'` cannot be dispatched on. Use a sentinel the key domain cannot produce if you
+need to route it explicitly.
+
 ## Named Parameters (kwargs)
 
 The `kwargs` parameter in `apply_with()` is not yet functional. Named parameters via struct are planned for a future release.
