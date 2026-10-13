@@ -83,45 +83,33 @@ SELECT func_dispatch(MAP{'a': 'm_zero_arg', 'b': 'm_one_arg'}, 'a');
 A routing map should dispatch only to functions that all accept the arguments
 the call site forwards and agree on a return type.
 
-### Don't wrap `func_dispatch()` in a convenience macro that forwards the wrapping macro's own parameter
+This check only runs when the forwarded argument types are actually known. A
+macro body's own parameter, a prepared-statement `?`, and a bare `NULL` have no
+concrete type at bind time, and a route cannot meaningfully be judged against an
+argument it knows nothing about — so in those cases no candidate is checked and
+the return type falls back to `VARCHAR`.
+
+A candidate that *is* callable but whose return type cannot be determined — its
+body folds away to `NULL` for any probe value, as `nullif(x, '')` does — is not
+an error either; the whole call falls back to `VARCHAR`.
+
+### Wrapping `func_dispatch()` in a macro returns `VARCHAR`, not the unified type
 
 A macro's body is bound once, eagerly, at `CREATE MACRO` time, using its own
-*not-yet-resolved* parameters — not just at each later call site. With a
-constant routing map, `func_dispatch` runs its per-candidate bind check
-(above) during that eager validation too, and a macro's own open parameter
-isn't a concrete type yet, so it fails the check even though it would bind
-fine at any real call site:
+*not-yet-resolved* parameters. A wrapper like
 
 ```sql
 CREATE MACRO clean_git(p) AS regexp_replace(p, '^git://', '');
 
--- Fails at CREATE MACRO time, not at call time:
 CREATE MACRO normalize_name(filename) AS
   func_dispatch(MAP{'git': 'clean_git'}, 'git', filename);
--- Error: func_dispatch: candidate 'clean_git' cannot be called with the
--- forwarded arguments; ...
 ```
 
-Call `func_dispatch` directly in the query instead of wrapping it in a new
-macro that forwards its own parameter — see the examples in
-[`docs/examples.md`](examples.md) and the README.
-
-### Known issue: macro candidates built with `||` can infer the wrong return type
-
-Independent of the two limitations above: a candidate macro whose body
-concatenates with `||` (e.g. `'GIT:' || regexp_replace(p, ...)`) can have its
-return type mis-inferred when the forwarded argument is not foldable — a
-column reference, for example. Measured: `func_dispatch` bound such a
-candidate's return type to `INTEGER` instead of `VARCHAR`, which then fails
-at run time trying to cast the real (string) result to `INTEGER`
-(`Could not convert string '...' to INT32`). This reproduces independently of
-the macro-wrapping issue above and predates this release's fix making
-unbindable candidates a bind error (it is a case where
-`TryInferCandidateReturnType` *does* report a type, just the wrong one, so
-that fix does not touch it). Workaround: build the candidate without `||`
-(e.g. `regexp_replace(p, '^git://', 'GIT:')` instead of
-`'GIT:' || regexp_replace(p, '^git://', '')`). Flagged here for follow-up;
-not fixed in this release.
+works, and `normalize_name('git://host/a.git')` returns the right value. But
+because `filename` has no concrete type when the body is validated,
+`func_dispatch` declines to bind the candidates there, so the wrapper's return
+type is `VARCHAR` — the same fallback a non-constant routing map gets. Call
+`func_dispatch` inline in the query when you need the real unified return type.
 
 ### `'*'` can be a dispatch key, but cannot route anywhere different from the fallback
 

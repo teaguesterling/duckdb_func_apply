@@ -455,6 +455,13 @@ the declared parameter type — the call is a bind error naming that candidate
 routing map should dispatch only to functions that all accept the arguments
 the call forwards and agree on a return type.
 
+This check requires the forwarded argument types to be known. A macro body's own
+parameter, a prepared-statement `?`, and a bare `NULL` have no concrete type at
+bind time; a route cannot be judged against an argument it knows nothing about,
+so no candidate is checked and the return type falls back to `VARCHAR`. That is
+what lets `CREATE MACRO normalize_name(filename) AS func_dispatch(...,
+filename)` be created and called.
+
 Arguments are forwarded **positionally only**. A named argument like
 `b := 'y'` is accepted, but its alias is ignored — the value is still
 matched by its position among `...args`, not by the name `b`.
@@ -538,6 +545,10 @@ security policy, which applies to every candidate including `'*'`.
   the fallback. See [Limitations](limitations.md).
 - A constant routing map requires every candidate to accept the forwarded
   arguments; a route that can't is a bind error, not a silent fallback. See
+  [Limitations](limitations.md).
+- Wrapping `func_dispatch` in a macro works, but the wrapper's return type is
+  `VARCHAR`: the wrapping macro's own parameter has no concrete type when the
+  body is validated, so the candidates cannot be bound there. See
   [Limitations](limitations.md).
 
 ---

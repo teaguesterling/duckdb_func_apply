@@ -107,14 +107,25 @@ FROM (VALUES ('git://host/a/b.git')) t(filename);
 -- Result: GIT:host/a/b.git
 ```
 
-**Call `func_dispatch` directly rather than wrapping it in a convenience
-macro that forwards the wrapping macro's own parameter** (e.g. `CREATE MACRO
-normalize_name(filename) AS func_dispatch(MAP{...}, ..., filename)`). A
-macro's body is validated against its own not-yet-resolved parameters when
-the macro is *created*; with a constant routing map that validation hits the
-same per-candidate check as a real call, and the parameter isn't a concrete
-type yet, so the `CREATE MACRO` itself fails even though every real call
-site binds correctly. See [Limitations](docs/limitations.md).
+You can wrap it in a convenience macro that forwards the wrapping macro's own
+parameter:
+
+```sql
+CREATE MACRO normalize_name(filename) AS
+  func_dispatch(MAP{'git': 'get_git_object_path', 'https': 'get_http_path'},
+                'git',
+                filename);
+
+SELECT normalize_name('git://host/a/b.git');
+-- Result: GIT:host/a/b.git
+```
+
+A macro's body is validated when the macro is *created*, and at that point
+`filename` has no concrete type yet. `func_dispatch` detects that the forwarded
+argument types are unknown and skips its per-candidate bind check entirely,
+falling back to `VARCHAR` — it cannot judge whether a route accepts an argument
+it knows nothing about. Call sites that forward concrete types still get the
+full check and the real return type.
 
 Unlike `apply()` with a dynamic name, `func_dispatch` binds every function in
 the routing map at plan time, so the result keeps its **real type**:
@@ -135,7 +146,9 @@ SELECT typeof(func_dispatch(MAP{'a':'pair'}, 'a', 7));                 -- INTEGE
 | `key` is `NULL` | `NULL` |
 | `routes` contains a `'*'` entry | used when `key` is missing |
 | candidates return different types | unified where an implicit cast exists (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error otherwise, which includes `INTEGER`+`VARCHAR` — true even if one candidate's body is a bare literal |
-| a candidate can't be bound against the forwarded arguments (e.g. wrong arity) | the **whole call** silently falls back to `VARCHAR`, as if `routes` were not a constant, no matter what the other candidates agree on; that candidate's arity is only caught if it's actually invoked, at run time |
+| a candidate can't be bound against the forwarded arguments (e.g. wrong arity) | a bind error for the **whole call**, no matter what the other candidates agree on — every route in a constant routing map must accept the forwarded arguments |
+| a forwarded argument has no concrete type yet (a macro body's own parameter, a prepared-statement `?`, a bare `NULL`) | no candidate is judged; the return type falls back to `VARCHAR` |
+| a candidate is callable but its return type can't be determined (its body folds to `NULL`) | the return type falls back to `VARCHAR`; not an error |
 | `routes` is not a constant | works, but the return type falls back to `VARCHAR` |
 
 **Watch the key extractor.** The map key must match exactly what the extractor
