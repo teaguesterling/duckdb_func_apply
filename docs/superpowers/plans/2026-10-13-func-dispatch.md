@@ -14,6 +14,8 @@
 
 - Must compile against **both** DuckDB lines. Never call a v2.0-only API directly; use the shims in `src/include/duckdb_compat.hpp` (`CompatBindSetReturnType`, `CompatExprReturnType`, `CompatMakeName`, `CompatSetScalarVarArgs`, `CompatSetScalarNullHandling`, `CompatSetCaptureArgumentAliases`, `DUCKDB_SCALAR_BIND_PARAMS`).
 - C++17 only. `std::map::contains` and other C++20 members are forbidden — they compile on the v2.0 line and break the pinned line.
+- Build a literal expression with `CompatConstant(value)`, **never** `make_uniq<ConstantExpression>(value)`. v2.0 deletes the `Value` constructor in favour of `FromValue`; commit `50d4118` removed every direct use and the shim exists so there are none. Reintroducing one breaks the v2.0 build only.
+- Base branch is `feat/func-dispatch`, cut from `origin/main` (`2827ad8`). The duckdb submodule must read `v1.5.6` (`069cc9f9b5`) — run `git submodule update --init --recursive` if `git submodule status` shows a `+` prefix.
 - Never use braced-init for aggregates that narrow an integer (e.g. `int64_t` into `idx_t`). gcc warns; clang and MSVC **error**. Use an explicit `static_cast`.
 - Wildcard key is the literal string `*`, defined once as `FUNC_DISPATCH_WILDCARD`.
 - Security policy is enforced at **run time only** (via `ExecuteFunction`). Bind must not consult it.
@@ -27,7 +29,7 @@
 Deliverable: a working `func_dispatch` that dispatches correctly and returns VARCHAR (typing comes in Task 2).
 
 **Files:**
-- Modify: `src/func_apply_extension.cpp` (add section after the `apply_with` section; register in `LoadInternal` near the existing `apply` registration at ~line 1357)
+- Modify: `src/func_apply_extension.cpp` (add section after the `apply_with` section; register in `LoadInternal` near the existing `apply_with` registration at ~line 1411)
 - Test: `test/sql/func_dispatch.test` (create)
 
 **Interfaces:**
@@ -290,7 +292,7 @@ Claude-Session: https://claude.ai/code/session_01XoHU19qnngy1CJnXyX1csz"
 Deliverable: the actual point of the feature — real return types instead of VARCHAR.
 
 **Files:**
-- Modify: `src/func_apply_extension.cpp` (factor a helper out of `BindApply` ~lines 686-742; replace the Task 1 stub `BindFuncDispatch`)
+- Modify: `src/func_apply_extension.cpp` (factor a helper out of `BindApply`'s scalar branch ~line 695 and macro branch ~line 712; replace the Task 1 stub `BindFuncDispatch`)
 - Test: `test/sql/func_dispatch_typing.test` (create)
 
 **Interfaces:**
@@ -460,17 +462,18 @@ static bool TryInferCandidateReturnType(ClientContext &context, const string &fu
 		for (idx_t i = first_arg_idx; i < arguments.size(); i++) {
 			if (arguments[i]->IsFoldable()) {
 				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
-				parsed_args.push_back(make_uniq<ConstantExpression>(val));
+				parsed_args.push_back(CompatConstant(val));
 			} else {
 				// A typed NULL placeholder: Value(LogicalType) is a NULL of that type.
-				parsed_args.push_back(make_uniq<ConstantExpression>(Value(CompatExprReturnType(*arguments[i]))));
+				parsed_args.push_back(CompatConstant(Value(CompatExprReturnType(*arguments[i]))));
 			}
 		}
-		auto func_expr = make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
+		unique_ptr<ParsedExpression> func_expr =
+		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
 		try {
 			auto binder = Binder::CreateBinder(context);
 			ConstantBinder constant_binder(*binder, context, "func_dispatch");
-			auto bound_expr = constant_binder.Bind(reinterpret_cast<unique_ptr<ParsedExpression> &>(func_expr));
+			auto bound_expr = constant_binder.Bind(func_expr);
 			out = CompatExprReturnType(*bound_expr);
 			return true;
 		} catch (...) {
@@ -481,17 +484,6 @@ static bool TryInferCandidateReturnType(ClientContext &context, const string &fu
 	return false;
 }
 ```
-
-Note on the `reinterpret_cast`: `ConstantBinder::Bind` takes `unique_ptr<ParsedExpression>&`. If `func_expr` is already declared as `unique_ptr<ParsedExpression>` the cast is unnecessary — prefer declaring it that way and dropping the cast:
-
-```cpp
-		unique_ptr<ParsedExpression> func_expr =
-		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
-		...
-		auto bound_expr = constant_binder.Bind(func_expr);
-```
-
-Use this second form. It matches the existing code at `BindApply`.
 
 - [ ] **Step 4: Replace BindFuncDispatch with the unifying version**
 
