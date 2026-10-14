@@ -1,0 +1,62 @@
+# name: test/sql/func_dispatch_security.test
+# description: func_dispatch honors the session security policy
+# group: [sql]
+
+require func_apply
+
+statement ok
+CREATE MACRO s_ok(x) AS 'OK:' || x;
+
+statement ok
+CREATE MACRO s_blocked(x) AS 'BLOCKED:' || x;
+
+# --- whitelist mode: an allowed candidate still works ---
+statement ok
+SELECT func_apply_set_security_mode('whitelist');
+
+statement ok
+SELECT func_apply_set_whitelist(['s_ok']);
+
+query I
+SELECT func_dispatch(MAP{'a': 's_ok'}, 'a', 'x');
+----
+OK:x
+
+# --- a candidate outside the whitelist is blocked at run time ---
+statement error
+SELECT func_dispatch(MAP{'a': 's_blocked'}, 'a', 'x');
+----
+blocked
+
+# --- on_block = 'null' yields NULL rather than an error ---
+statement ok
+SELECT func_apply_set_on_block('null');
+
+query I
+SELECT func_dispatch(MAP{'a': 's_blocked'}, 'a', 'x') IS NULL;
+----
+true
+
+# --- on_block = 'default' yields the configured value ---
+statement ok
+SELECT func_apply_set_on_block('default');
+
+statement ok
+SELECT func_apply_set_block_default('FALLBACK');
+
+query I
+SELECT func_dispatch(MAP{'a': 's_blocked'}, 'a', 'x');
+----
+FALLBACK
+
+# --- the wildcard route is policed too: it is not a side door ---
+statement ok
+SELECT func_apply_set_on_block('error');
+
+statement error
+SELECT func_dispatch(MAP{'*': 's_blocked'}, 'anything', 'x');
+----
+blocked
+
+statement ok
+SELECT func_apply_set_security_mode('none');

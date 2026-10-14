@@ -363,3 +363,50 @@ SELECT DISTINCT func_name
 FROM config_table
 WHERE NOT function_exists(func_name);
 ```
+
+## Routing URLs to per-scheme cleaners
+
+```sql
+LOAD func_apply;
+LOAD urlpattern;
+
+CREATE MACRO clean_git(p)   AS regexp_replace(p, '^git://', '');
+CREATE MACRO clean_http(p)  AS regexp_replace(p, '^https?://', '');
+CREATE MACRO clean_other(p) AS p;
+
+SELECT u,
+       func_dispatch(MAP{'git':   'clean_git',
+                         'http':  'clean_http',
+                         'https': 'clean_http',
+                         '*':     'clean_other'},
+                     urlpattern_protocol(u),
+                     u) AS cleaned
+FROM (VALUES ('git://host/a.git'), ('https://host/b'), ('s3://bucket/c')) t(u);
+```
+
+The `'*'` entry catches every scheme the table does not name, so an unknown
+scheme passes through instead of becoming `NULL`.
+
+Wrapping the dispatch in a named macro keeps the call sites short:
+
+```sql
+CREATE MACRO normalize_name(filename) AS
+  func_dispatch(MAP{'git':   'clean_git',
+                    'http':  'clean_http',
+                    'https': 'clean_http',
+                    '*':     'clean_other'},
+                urlpattern_protocol(filename),
+                filename);
+
+SELECT u, normalize_name(u) AS cleaned
+FROM (VALUES ('git://host/a.git'), ('https://host/b'), ('s3://bucket/c')) t(u);
+```
+
+A macro's body is validated against its own parameters when the macro is
+*created*, before any real call site exists, and at that point `filename` has no
+concrete type. `func_dispatch` notices that and skips its per-candidate bind
+check: it cannot judge whether a route accepts an argument whose type is
+unknown. The wrapper therefore returns `VARCHAR` rather than the unified
+candidate type — the same fallback a non-constant routing map gets. Call
+`func_dispatch` inline (as in the query above) when you want the real return
+type. See [Limitations](limitations.md).

@@ -652,6 +652,226 @@ static Value ExecuteFunction(ClientContext &context, const string &func_name, co
 // apply(func VARCHAR, ...args ANY) -> ANY
 //===--------------------------------------------------------------------===//
 
+//! Build a representative NON-NULL value of `type`, for use as a stand-in when
+//! probing what a macro body returns for a non-foldable argument.
+//!
+//! Why non-NULL matters: a macro body is probed by binding it against constant
+//! arguments, and that binding constant-folds. A *NULL* stand-in makes any
+//! NULL-propagating body fold to a SQLNULL constant -- `'GIT:' || NULL` has type
+//! "NULL", not VARCHAR -- and SQLNULL handed back as a scalar function's return
+//! type then materializes as INTEGER. That mis-typed `apply('clean_git', col)`
+//! as INTEGER and made it fail at run time casting 'GIT:a' to INT32.
+//!
+//! Magnitudes are deliberately small rather than `Value::MinimumValue(type)`:
+//! MinimumValue(INTEGER) is INT32_MIN, which makes an ordinary body like
+//! `x - 1` raise an overflow during folding and so look unbindable.
+//!
+//! Every representable type is enumerated explicitly below, including the
+//! temporals -- DATE, TIME[_TZ], TIMESTAMP[_TZ/_SEC/_MS/_NS], INTERVAL, UUID --
+//! each with a small, safe, non-edge value for the same overflow reason as the
+//! numerics. There is deliberately no `default: Value::MinimumValue(type)`
+//! fallback: MinimumValue has no case for LIST/STRUCT/MAP/ARRAY/UNION/ENUM on
+//! EITHER supported DuckDB line (confirmed by reading both trees' value.cpp --
+//! both fall to *its own* default and throw "MinimumValue requires numeric
+//! type"), so that fallback never actually produced a probe for those types on
+//! either line; it only added a reliance on exception-based control flow for a
+//! codepath that always returned false anyway. `default: return false` makes
+//! that outcome a direct fact about this function instead of an accident of
+//! what some other function happens to throw this release.
+static bool TryMakeProbeValue(const LogicalType &type, Value &out) {
+	switch (type.id()) {
+	case LogicalTypeId::INVALID:
+	case LogicalTypeId::SQLNULL:
+	case LogicalTypeId::UNKNOWN:
+	case LogicalTypeId::ANY:
+		// No concrete type to represent. (MinimumValue would answer INTEGER for
+		// SQLNULL, which is exactly the wrong guess.)
+		return false;
+	case LogicalTypeId::BOOLEAN:
+		out = Value::BOOLEAN(false);
+		return true;
+	case LogicalTypeId::VARCHAR:
+		out = Value(string());
+		return true;
+	case LogicalTypeId::BLOB:
+		out = Value::BLOB_RAW(string());
+		return true;
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		out = Value::Numeric(type, static_cast<int64_t>(1));
+		return true;
+	case LogicalTypeId::DATE:
+		// 2000-01-01: far from DATE_MIN/MAX, so date arithmetic in a macro body
+		// (`x - 1`, `x + INTERVAL 1 DAY`, ...) cannot overflow or underflow.
+		out = Value::DATE(2000, 1, 1);
+		return true;
+	case LogicalTypeId::TIME:
+		out = Value::TIME(12, 0, 0, 0);
+		return true;
+	case LogicalTypeId::TIME_TZ:
+		// 12:00:00+00, built from raw micros-since-midnight to avoid depending on
+		// the Time helper class being in scope here.
+		out = Value::TIMETZ(dtime_tz_t(dtime_t(static_cast<int64_t>(12LL * 3600 * 1000000)), 0));
+		return true;
+	case LogicalTypeId::TIMESTAMP:
+		out = Value::TIMESTAMP(2000, 1, 1, 12, 0, 0, 0);
+		return true;
+	case LogicalTypeId::TIMESTAMP_TZ:
+		// Same instant as the TIMESTAMP probe above, expressed in micros-since-epoch.
+		out = Value::TIMESTAMPTZ(timestamp_tz_t(static_cast<int64_t>(946728000000000LL)));
+		return true;
+	case LogicalTypeId::TIMESTAMP_SEC:
+		out = Value::TIMESTAMPSEC(timestamp_sec_t(static_cast<int64_t>(946728000LL)));
+		return true;
+	case LogicalTypeId::TIMESTAMP_MS:
+		out = Value::TIMESTAMPMS(timestamp_ms_t(static_cast<int64_t>(946728000000LL)));
+		return true;
+	case LogicalTypeId::TIMESTAMP_NS:
+		out = Value::TIMESTAMPNS(timestamp_ns_t(static_cast<int64_t>(946728000000000000LL)));
+		return true;
+	case LogicalTypeId::INTERVAL:
+		// Zero interval: adding/subtracting it can never overflow a probe on the
+		// other side of a `+`/`-` either.
+		out = Value::INTERVAL(0, 0, 0);
+		return true;
+	case LogicalTypeId::UUID:
+		out = Value::UUID(hugeint_t(1));
+		return true;
+	default:
+		// Nested types (LIST, STRUCT, MAP, ARRAY, UNION), ENUM, and anything
+		// introduced after this list was written: no safe concrete probe is
+		// available. Previously this fell through to `Value::MinimumValue(type)`
+		// in a try/catch; that throws "MinimumValue requires numeric type" for
+		// every one of these on both v1.5.6 and v2.0-cyanoptera (neither has a
+		// case for them), so the catch always returned false anyway. Returning
+		// false directly here removes the dependence on exception behavior and
+		// makes the "no probe for this type" outcome identical by construction
+		// on every DuckDB line, present and future, rather than identical only
+		// because two unrelated functions both happen to throw today.
+		return false;
+	}
+}
+
+//! Outcome of trying to infer a candidate's return type.
+enum class InferOutcome : uint8_t {
+	//! A usable concrete return type was determined.
+	INFERRED,
+	//! The candidate cannot be bound against these arguments at all -- wrong
+	//! arity, or argument types it has no overload for. A genuine user error.
+	UNBINDABLE,
+	//! The candidate bound fine, but no usable type came back (the probe folded
+	//! to SQLNULL, or the function kind is not introspectable). Not an error:
+	//! the caller should keep its documented VARCHAR default.
+	INDETERMINATE
+};
+
+//! Infer what `func_name` returns when called with `arguments[first_arg_idx..]`.
+//! Handles both scalar functions (FunctionBinder) and macros (full expression
+//! binding against probe constants).
+//!
+//! The three-way outcome exists because "could not type it" and "cannot be
+//! called that way" need different handling: func_dispatch raises a bind error
+//! for the latter but must not for the former, or a valid macro whose body
+//! happens to fold to NULL (`nullif(x, '')`) would be rejected outright.
+static InferOutcome TryInferCandidateReturnType(ClientContext &context, const string &func_name,
+                                                const vector<unique_ptr<Expression>> &arguments, idx_t first_arg_idx,
+                                                LogicalType &out) {
+	auto func_type = GetCallableFunctionType(context, func_name);
+
+	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		vector<unique_ptr<Expression>> target_args;
+		for (idx_t i = first_arg_idx; i < arguments.size(); i++) {
+			target_args.push_back(arguments[i]->Copy());
+		}
+		ErrorData error;
+		FunctionBinder binder(context);
+		auto bound_expr =
+		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(target_args), error);
+		if (error.HasError() || !bound_expr) {
+			return InferOutcome::UNBINDABLE;
+		}
+		auto &bound_type = CompatExprReturnType(*bound_expr);
+		if (bound_type.id() == LogicalTypeId::SQLNULL) {
+			return InferOutcome::INDETERMINATE;
+		}
+		out = bound_type;
+		return InferOutcome::INFERRED;
+	}
+
+	if (func_type == CatalogType::MACRO_ENTRY) {
+		vector<unique_ptr<ParsedExpression>> parsed_args;
+		for (idx_t i = first_arg_idx; i < arguments.size(); i++) {
+			if (arguments[i]->IsFoldable()) {
+				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
+				parsed_args.push_back(CompatConstant(val));
+			} else {
+				Value probe;
+				if (!TryMakeProbeValue(CompatExprReturnType(*arguments[i]), probe)) {
+					// No safe probe exists for this argument's type (a nested type --
+					// LIST, STRUCT, MAP, ARRAY, UNION -- or anything else
+					// TryMakeProbeValue does not enumerate). An earlier version of this
+					// code still substituted a typed NULL here and asked the binder to
+					// judge it anyway, reasoning that an SQLNULL result would be caught
+					// below. But whether `<op>(..., NULL::<nested type>)` binds at all is
+					// itself a version-dependent judgment call, not a fact about the
+					// macro: measured directly, v1.5.6 permits
+					// `'GIT:' || NULL::INTEGER[]` (it folds to a bare SQLNULL constant,
+					// caught below) while v2.0-cyanoptera refuses the same call outright
+					// (a genuine Binder Error, caught by the catch(...) below as
+					// UNBINDABLE) -- which is exactly what turned a LIST-valued argument
+					// to a constant-routing-map candidate into a spurious bind error in
+					// CI instead of the documented VARCHAR fallback. Deciding
+					// INDETERMINATE right here, before any version-specific binder gets a
+					// vote, is the only way to make that decision identical on both
+					// lines. See test/sql/func_dispatch_typing.test's LIST/STRUCT cases.
+					return InferOutcome::INDETERMINATE;
+				}
+				parsed_args.push_back(CompatConstant(std::move(probe)));
+			}
+		}
+		unique_ptr<ParsedExpression> func_expr =
+		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
+		LogicalType bound_type;
+		try {
+			auto binder = Binder::CreateBinder(context);
+			// Keep SQLNULL observable. ExpressionBinder::Bind otherwise wraps an
+			// SQLNULL result in a cast to INTEGER ("SQL NULL type is only used
+			// internally in the binder"), so a body that folds to NULL comes back as a
+			// confident, wrong INTEGER and the check below could never fire --
+			// measured: bound_type=INTEGER for `'GIT:' || <NULL>`. Use the public
+			// setter: the underlying field is private on both lines and was renamed to
+			// legacy_can_contain_nulls in v2.0.
+			binder->SetCanContainNulls(true);
+			ConstantBinder constant_binder(*binder, context, "func_dispatch");
+			auto bound_expr = constant_binder.Bind(func_expr);
+			bound_type = CompatExprReturnType(*bound_expr);
+		} catch (...) {
+			return InferOutcome::UNBINDABLE;
+		}
+		if (bound_type.id() == LogicalTypeId::SQLNULL) {
+			// The probe folded the body away to an untyped NULL. Propagating that
+			// would surface as INTEGER; a wrong concrete type is worse than the
+			// documented VARCHAR fallback.
+			return InferOutcome::INDETERMINATE;
+		}
+		out = bound_type;
+		return InferOutcome::INFERRED;
+	}
+
+	return InferOutcome::INDETERMINATE;
+}
+
 static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
 #ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
 	// v2.0 collapsed the three bind parameters into a single input object. Unpack
@@ -688,55 +908,13 @@ static unique_ptr<FunctionData> BindApply(DUCKDB_SCALAR_BIND_PARAMS) {
 	// Check the function type (only scalar functions and macros are callable via apply)
 	auto func_type = GetCallableFunctionType(context, func_name);
 
-	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY) {
-		// For scalar functions, use FunctionBinder directly
-		// FunctionBinder handles overload resolution and type coercion automatically
-		vector<unique_ptr<Expression>> target_args;
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			target_args.push_back(arguments[i]->Copy());
+	if (func_type == CatalogType::SCALAR_FUNCTION_ENTRY || func_type == CatalogType::MACRO_ENTRY) {
+		LogicalType inferred;
+		if (TryInferCandidateReturnType(context, func_name, arguments, 1, inferred) == InferOutcome::INFERRED) {
+			CompatBindSetReturnType(bound_function, inferred);
 		}
-
-		ErrorData error;
-		FunctionBinder binder(context);
-		auto bound_expr =
-		    binder.BindScalarFunction(DEFAULT_SCHEMA, CompatMakeName(func_name), std::move(target_args), error);
-
-		if (error.HasError() || !bound_expr) {
-			return nullptr;
-		}
-
-		CompatBindSetReturnType(bound_function, CompatExprReturnType(*bound_expr));
-		return nullptr;
-	}
-
-	if (func_type == CatalogType::MACRO_ENTRY) {
-		// For macros, use the full expression binding path
-		vector<unique_ptr<ParsedExpression>> parsed_args;
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			// Try to evaluate constant expressions, otherwise create a placeholder
-			if (arguments[i]->IsFoldable()) {
-				auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[i]);
-				parsed_args.push_back(CompatConstant(val));
-			} else {
-				// For non-constant expressions, we need to use the expression's type
-				// Create a constant with a dummy value of the right type
-				parsed_args.push_back(CompatConstant(Value(CompatExprReturnType(*arguments[i]))));
-			}
-		}
-
-		unique_ptr<ParsedExpression> func_expr =
-		    make_uniq<FunctionExpression>(CompatMakeName(func_name), std::move(parsed_args));
-
-		try {
-			auto binder = Binder::CreateBinder(context);
-			ConstantBinder constant_binder(*binder, context, "apply");
-			auto bound_expr = constant_binder.Bind(func_expr);
-			CompatBindSetReturnType(bound_function, CompatExprReturnType(*bound_expr));
-		} catch (...) {
-			// If binding fails, fall back to VARCHAR
-			return nullptr;
-		}
-
+		// UNBINDABLE and INDETERMINATE both keep the VARCHAR default: apply() has
+		// always deferred such calls to run time rather than failing at bind time.
 		return nullptr;
 	}
 
@@ -923,6 +1101,199 @@ static void ApplyWithScalarFun(DataChunk &args, ExpressionState &state, Vector &
 			throw InvalidInputException("apply_with('%s'): %s", func_name, e.what());
 		}
 	}
+}
+
+//===--------------------------------------------------------------------===//
+// func_dispatch(routes MAP(VARCHAR,VARCHAR), key VARCHAR, ...args ANY) -> ANY
+//===--------------------------------------------------------------------===//
+
+//! Routing-table key whose value is used when the dispatch key is absent.
+//! A literal '*' CAN still be a dispatch key: LookupRoute's exact-match pass finds
+//! it like any other key, so func_dispatch(MAP{'*':'upper'}, '*', 'x') -> 'X'. The
+//! real limitation is narrower: '*' cannot route anywhere DIFFERENT from the
+//! fallback, because any exact match on '*' and the wildcard fallback read the same
+//! map entry. Documented in docs/limitations.md.
+static constexpr const char *FUNC_DISPATCH_WILDCARD = "*";
+
+//! Resolve `key` against a MAP value, falling back to FUNC_DISPATCH_WILDCARD.
+//! Returns false when nothing matched (caller yields NULL).
+static bool LookupRoute(const Value &routes, const string &key, string &out_name) {
+	if (routes.IsNull()) {
+		return false;
+	}
+	auto &entries = MapValue::GetChildren(routes);
+	string wildcard_name;
+	bool have_wildcard = false;
+	for (auto &entry : entries) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv[0].IsNull() || kv[1].IsNull()) {
+			continue;
+		}
+		auto entry_key = StringValue::Get(kv[0]);
+		if (entry_key == key) {
+			out_name = StringValue::Get(kv[1]);
+			return true;
+		}
+		if (entry_key == FUNC_DISPATCH_WILDCARD) {
+			wildcard_name = StringValue::Get(kv[1]);
+			have_wildcard = true;
+		}
+	}
+	if (have_wildcard) {
+		out_name = wildcard_name;
+		return true;
+	}
+	return false;
+}
+
+static unique_ptr<FunctionData> BindFuncDispatch(DUCKDB_SCALAR_BIND_PARAMS) {
+#ifdef DUCKDB_HAS_NEW_VECTOR_HEADERS
+	auto &context = bind_input.GetClientContext();
+	auto &arguments = bind_input.GetArguments();
+	auto &bound_function = bind_input.GetBoundFunction();
+#endif
+	CompatBindSetReturnType(bound_function, LogicalType::VARCHAR);
+
+	if (arguments.size() < 2) {
+		throw BinderException("func_dispatch requires a routing map and a key");
+	}
+
+	// A non-foldable routing table is unknowable at plan time: keep VARCHAR.
+	// Documented in docs/limitations.md.
+	if (!arguments[0]->IsFoldable()) {
+		return nullptr;
+	}
+
+	Value routes = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+	if (routes.IsNull()) {
+		return nullptr;
+	}
+
+	auto &entries = MapValue::GetChildren(routes);
+	if (entries.empty()) {
+		return nullptr;
+	}
+
+	// Do not judge candidates when we do not know what will be forwarded to them.
+	//
+	// `CREATE MACRO normalize_name(filename) AS func_dispatch(..., filename)` --
+	// the documented wrapping pattern -- validates its body eagerly, and at that
+	// point `filename` is an unresolved parameter: measured as LogicalTypeId::UNKNOWN
+	// on v1.5.6. Binding every route against it fails for reasons that have nothing
+	// to do with the routes, so the arity check below would reject a correct macro at
+	// CREATE time. A bare `NULL` literal (LogicalTypeId::SQLNULL) carries no type
+	// either, and prepared-statement parameters (`?`) also arrive as UNKNOWN.
+	//
+	// When we cannot know what will be passed, we cannot meaningfully check whether a
+	// candidate accepts it, so judging is unsound; when we do know, a candidate that
+	// cannot accept the arguments is a genuine error worth failing loudly.
+	for (idx_t i = 2; i < arguments.size(); i++) {
+		auto arg_type_id = CompatExprReturnType(*arguments[i]).id();
+		if (arg_type_id == LogicalTypeId::UNKNOWN || arg_type_id == LogicalTypeId::SQLNULL) {
+			return nullptr;
+		}
+	}
+
+	LogicalType unified;
+	bool have_unified = false;
+
+	for (auto &entry : entries) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv[1].IsNull()) {
+			throw BinderException("func_dispatch: routing map has a NULL function name");
+		}
+		auto candidate = StringValue::Get(kv[1]);
+		if (!IsValidIdentifier(candidate)) {
+			throw BinderException("func_dispatch: invalid function name '%s'", candidate);
+		}
+
+		auto func_type = GetCallableFunctionType(context, candidate);
+		if (func_type == CatalogType::INVALID) {
+			if (TableFunctionExists(context, candidate)) {
+				throw BinderException("func_dispatch: '%s' is a table function. Use apply_table() instead.", candidate);
+			}
+			throw BinderException("func_dispatch: function '%s' does not exist", candidate);
+		}
+
+		LogicalType candidate_type;
+		auto outcome = TryInferCandidateReturnType(context, candidate, arguments, 2, candidate_type);
+		if (outcome == InferOutcome::UNBINDABLE) {
+			// Silently falling back to VARCHAR here produced a wrong VALUE, not merely
+			// a weaker type: len(func_dispatch(MAP{'a':'m_list1','b':'m_two'}, 'a', 7))
+			// returned 6 (the character count of the stringified '[7, 7]') instead of 2,
+			// from a fully constant routing map. A route that cannot accept the forwarded
+			// arguments is already unusable -- invoking it throws "Macro ... does not
+			// support the supplied arguments" -- so surface that at bind time instead of
+			// papering over it.
+			throw BinderException("func_dispatch: candidate '%s' cannot be called with the forwarded arguments; "
+			                      "every route in a constant routing map must accept them "
+			                      "(or make the routing map non-constant to fall back to VARCHAR)",
+			                      candidate);
+		}
+		if (outcome == InferOutcome::INDETERMINATE) {
+			// The candidate is callable, we just could not type it. The unified type has
+			// to cover this route too, so the only honest answer for the whole call is
+			// the documented VARCHAR default -- not an error, and not a type derived
+			// from the routes we happened to be able to read.
+			return nullptr;
+		}
+
+		if (!have_unified) {
+			unified = candidate_type;
+			have_unified = true;
+			continue;
+		}
+
+		LogicalType merged;
+		if (!LogicalType::TryGetMaxLogicalType(context, unified, candidate_type, merged)) {
+			throw BinderException(
+			    "func_dispatch: candidate return types %s and %s cannot be unified; the routing map must "
+			    "dispatch to functions with a common return type",
+			    unified.ToString(), candidate_type.ToString());
+		}
+		unified = merged;
+	}
+
+	if (have_unified) {
+		CompatBindSetReturnType(bound_function, unified);
+	}
+	return nullptr;
+}
+
+static void FuncDispatchScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	idx_t count = args.size();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto routes = args.data[0].GetValue(i);
+		auto key_val = args.data[1].GetValue(i);
+		if (routes.IsNull() || key_val.IsNull()) {
+			result.SetValue(i, Value());
+			continue;
+		}
+
+		string func_name;
+		if (!LookupRoute(routes, StringValue::Get(key_val), func_name)) {
+			result.SetValue(i, Value());
+			continue;
+		}
+
+		if (!IsValidIdentifier(func_name)) {
+			throw InvalidInputException("func_dispatch: invalid function name '%s'", func_name);
+		}
+
+		vector<Value> func_args;
+		for (idx_t j = 2; j < args.ColumnCount(); j++) {
+			func_args.push_back(args.data[j].GetValue(i));
+		}
+
+		try {
+			result.SetValue(i, ExecuteFunction(context, func_name, func_args));
+		} catch (const Exception &e) {
+			throw InvalidInputException("func_dispatch('%s'): %s", func_name, e.what());
+		}
+	}
+	result.SetVectorType(VectorType::FLAT_VECTOR);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1416,6 +1787,31 @@ static void LoadInternal(ExtensionLoader &loader) {
 		desc.parameter_names = {"func_name"};
 		desc.description = "Dynamically invoke a scalar function with a list of positional args and struct of kwargs.";
 		desc.examples = {"apply_with('upper', args := ['hello'])"};
+		desc.categories = {"func_apply"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
+
+	// Register func_dispatch (map-driven dispatch, variadic forwarded args)
+	auto func_dispatch_func = ScalarFunction(
+	    "func_dispatch", {LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), LogicalType::VARCHAR},
+	    LogicalType::ANY, FuncDispatchScalarFun, BindFuncDispatch);
+	CompatSetScalarVarArgs(func_dispatch_func, LogicalType::ANY);
+	CompatSetScalarNullHandling(func_dispatch_func, FunctionNullHandling::SPECIAL_HANDLING);
+	// func_dispatch never reads argument aliases -- forwarding is purely positional,
+	// and a named arg like `b := 'y'` is silently matched by position, not by name.
+	// This call is retained anyway, for argument-acceptance parity with apply_with:
+	// whether v2.0 accepts a named argument here at all is governed by the same flag
+	// (unverified whether dropping it would cause v2.0 to reject named args outright).
+	CompatSetCaptureArgumentAliases(func_dispatch_func);
+	func_dispatch_func.SetFallible();
+	{
+		CreateScalarFunctionInfo info(std::move(func_dispatch_func));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"routes", "key"};
+		desc.description = "Dispatch to the function named by routes[key], forwarding the remaining arguments.";
+		desc.examples = {"func_dispatch(MAP {'a': 'upper', '*': 'lower'}, 'a', 'hello')"};
 		desc.categories = {"func_apply"};
 		info.descriptions.push_back(desc);
 		loader.RegisterFunction(std::move(info));

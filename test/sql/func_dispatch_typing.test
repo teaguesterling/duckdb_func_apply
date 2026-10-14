@@ -1,0 +1,302 @@
+# name: test/sql/func_dispatch_typing.test
+# description: func_dispatch resolves real return types; apply() cannot
+# group: [sql]
+
+require func_apply
+
+statement ok
+CREATE MACRO m_int(x) AS x + 1;
+
+statement ok
+CREATE MACRO m_list(x) AS [x, x];
+
+statement ok
+CREATE MACRO m_struct(x) AS {'v': x};
+
+statement ok
+CREATE MACRO m_big(x) AS x::BIGINT;
+
+statement ok
+CREATE MACRO m_str(x) AS x::VARCHAR;
+
+# --- CONTROL: apply() with a dynamic name collapses to VARCHAR.
+# These assertions document the defect func_dispatch fixes. If they ever
+# report something other than VARCHAR, the premise of this feature changed.
+query I
+SELECT typeof(apply(MAP{'a': 'm_int'}[k], 41)) FROM (VALUES ('a')) t(k);
+----
+VARCHAR
+
+query I
+SELECT typeof(apply(MAP{'a': 'm_list'}[k], 7)) FROM (VALUES ('a')) t(k);
+----
+VARCHAR
+
+# --- func_dispatch keeps the real type ---
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_int'}, 'a', 41));
+----
+INTEGER
+
+query I
+SELECT func_dispatch(MAP{'a': 'm_int'}, 'a', 41);
+----
+42
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_list'}, 'a', 7));
+----
+INTEGER[]
+
+# a real list, not the string '[7, 7]' -- this is the user-visible payoff
+query I
+SELECT len(func_dispatch(MAP{'a': 'm_list'}, 'a', 7));
+----
+2
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_struct'}, 'a', 7));
+----
+STRUCT(v INTEGER)
+
+query I
+SELECT func_dispatch(MAP{'a': 'm_struct'}, 'a', 7).v;
+----
+7
+
+# --- unification across candidates ---
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_int', 'b': 'm_big'}, 'a', 41));
+----
+BIGINT
+
+# the '*' candidate participates in unification like any other
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_int', '*': 'm_big'}, 'a', 41));
+----
+BIGINT
+
+# --- unification failure is a bind error naming both types ---
+statement error
+SELECT func_dispatch(MAP{'a': 'm_list', 'b': 'm_struct'}, 'a', 7);
+----
+cannot be unified
+
+# INTEGER and VARCHAR are real (non-literal) candidate return types here, not
+# string literals, so DuckDB's implicit-cast table does not unify them (unlike
+# e.g. `CASE WHEN true THEN 1 ELSE 'abc' END`, where the VARCHAR *literal*
+# gets flexible typing and the case binds to INTEGER). TryGetMaxLogicalType
+# correctly reports no common type between two already-typed candidates.
+statement error
+SELECT func_dispatch(MAP{'a': 'm_int', 'b': 'm_str'}, 'a', 41);
+----
+cannot be unified
+
+# --- a candidate that can't be bound against the forwarded arguments is a
+# bind error for the WHOLE call, regardless of what any other candidate's
+# return type is ---
+#
+# This used to be a silent VARCHAR fallback that produced a wrong VALUE, not
+# merely a weaker type: with a constant routing map,
+# func_dispatch(MAP{'a': 'm_zero_arg_lit', 'b': 'm_one_arg_str'}, 'a') bound
+# the whole call to VARCHAR and returned the STRING '5' instead of the
+# INTEGER 5 that m_zero_arg_lit actually produces -- precisely the defect
+# func_dispatch exists to fix. It is now a bind error instead.
+statement ok
+CREATE MACRO m_zero_arg_lit() AS 5;
+
+statement ok
+CREATE MACRO m_one_arg_str(x) AS x::VARCHAR;
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_zero_arg_lit'}, 'a'));
+----
+INTEGER
+
+statement error
+SELECT func_dispatch(MAP{'a': 'm_zero_arg_lit', 'b': 'm_one_arg_str'}, 'a');
+----
+cannot be called with the forwarded arguments
+
+# --- the discriminating pair: same routing map and key, differing ONLY in
+# forwarded-argument count, to prove which failure mode fires on which side.
+#
+# m_lit_matched_arity(x) and m_str(x) both declare exactly one parameter.
+# Forward ZERO arguments: neither candidate's declared arity (1) matches the
+# call, so TryInferCandidateReturnType can't bind EITHER of them -- an arity
+# mismatch, same mechanism as the pair above -- and the call is a bind error.
+statement ok
+CREATE MACRO m_lit_matched_arity(x) AS 5;
+
+statement error
+SELECT func_dispatch(MAP{'a': 'm_lit_matched_arity', 'b': 'm_str'}, 'a');
+----
+cannot be called with the forwarded arguments
+
+# Forward ONE argument (41): arities now match for both candidates, so both
+# bind successfully -- proving the bind error above was caused by the arity
+# mismatch, not by "a literal return value is more permissive about implicit
+# casts." With arities satisfied, the real return types (INTEGER vs VARCHAR)
+# fail to unify instead -- a different bind error.
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_lit_matched_arity'}, 'a', 41));
+----
+INTEGER
+
+statement error
+SELECT func_dispatch(MAP{'a': 'm_lit_matched_arity', 'b': 'm_str'}, 'a', 41);
+----
+cannot be unified
+
+# --- bind-time validation ---
+statement error
+SELECT func_dispatch(MAP{'a': 'no_such_function_xyz'}, 'a', 1);
+----
+does not exist
+
+# NOTE: not 'range' -- in this DuckDB it is dual-purpose (also a scalar,
+# list-returning function), so GetCallableFunctionType resolves it via the
+# scalar branch before ever checking table functions. duckdb_functions is
+# table-function-only (same choice Task 1's func_dispatch.test makes).
+statement error
+SELECT func_dispatch(MAP{'a': 'duckdb_functions'}, 'a', 1);
+----
+apply_table
+
+# --- non-foldable routing table: still dispatches, documented VARCHAR ---
+# A projected column is never foldable: bind runs before optimization, so both of
+# these are VARCHAR. Measured via the apply proxy:
+#   typeof(apply(r, 41)) FROM (SELECT 'm_int' AS r) s  ->  VARCHAR
+query I
+SELECT typeof(func_dispatch(r, 'a', 41)) FROM (SELECT MAP{'a': 'm_int'} AS r) s;
+----
+VARCHAR
+
+query II
+SELECT func_dispatch(r, k, 41), typeof(func_dispatch(r, k, 41))
+FROM (VALUES (MAP{'a': 'm_int'}, 'a')) t(r, k);
+----
+42	VARCHAR
+
+# --- a `||`-bodied macro with a NON-FOLDABLE forwarded argument ---
+#
+# The return-type probe substitutes a stand-in constant for each non-foldable
+# argument. When that stand-in was a typed NULL, `'GIT:' || NULL` constant-folded
+# to SQLNULL, and the binder's "SQL NULL type is only used internally" rule cast
+# it to INTEGER -- so this typed as INTEGER and then failed at run time with
+# "Could not convert string 'GIT:a' to INT32".
+#
+# Two things fix it and both are pinned here: the stand-in is now a non-NULL
+# probe value (an empty string for VARCHAR), and an SQLNULL result is reported as
+# "could not type it" rather than propagated.
+#
+# These assertions discriminate: the value query cannot pass under the INTEGER
+# mis-inference (the cast throws), and the typeof query names the cause.
+statement ok
+CREATE MACRO m_cat(x) AS 'GIT:' || x;
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', u)) FROM (VALUES ('a')) t(u);
+----
+VARCHAR
+
+query I
+SELECT func_dispatch(MAP{'a': 'm_cat'}, 'a', u) FROM (VALUES ('a')) t(u);
+----
+GIT:a
+
+# the explicitly-cast variant behaves the same way
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', u::VARCHAR)),
+       func_dispatch(MAP{'a': 'm_cat'}, 'a', u::VARCHAR)
+FROM (VALUES ('a')) t(u);
+----
+VARCHAR	GIT:a
+
+# The non-NULL probe must not break the macros that already typed correctly:
+# m_list's body does not fold away, so it still resolves to a real LIST.
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_list'}, 'a', u)), len(func_dispatch(MAP{'a': 'm_list'}, 'a', u))
+FROM (VALUES (7)) t(u);
+----
+INTEGER[]	2
+
+# The probe value is deliberately small rather than the type's minimum: with
+# INT32_MIN as the stand-in, this body would overflow while folding and the
+# candidate would look unbindable, turning a valid call into a bind error.
+statement ok
+CREATE MACRO m_minus(x) AS x - 1;
+
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_minus'}, 'a', u)), func_dispatch(MAP{'a': 'm_minus'}, 'a', u)
+FROM (VALUES (5)) t(u);
+----
+INTEGER	4
+
+# A macro whose body folds to NULL even for a non-NULL probe must degrade to the
+# documented VARCHAR fallback, NOT raise "cannot be called with the forwarded
+# arguments" -- it is perfectly callable, we just cannot type it.
+statement ok
+CREATE MACRO m_nullif(x) AS nullif(x, '');
+
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_nullif'}, 'a', u)), func_dispatch(MAP{'a': 'm_nullif'}, 'a', u)
+FROM (VALUES ('z')) t(u);
+----
+VARCHAR	z
+
+# Same for an argument type with no cheap probe value (LIST or STRUCT): fall
+# back to VARCHAR rather than inferring INTEGER from the folded-away NULL.
+#
+# These two assertions are the contract between the two supported DuckDB
+# lines, not just a regression test: TryMakeProbeValue has no probe for a
+# nested type on either line, and the two lines disagree about whether a
+# typed-NULL stand-in of a nested type is even bindable against an arbitrary
+# macro body (v1.5.6: yes, folds to SQLNULL; v2.0-cyanoptera: no, a genuine
+# Binder Error). A constant routing map must still resolve to VARCHAR here on
+# BOTH lines -- if either assertion ever raises "cannot be called with the
+# forwarded arguments" instead of returning VARCHAR, the two lines have
+# diverged again (this is exactly what CI caught before this fix: the LIST
+# case below threw a bind error on v2.0-cyanoptera while passing here).
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', u)) FROM (VALUES ([1, 2])) t(u);
+----
+VARCHAR
+
+query I
+SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', u)) FROM (VALUES ({'v': 1})) t(u);
+----
+VARCHAR
+
+# --- the temporal probes are real, concrete values now, not an incidental
+# MinimumValue() throw-and-catch that happened to behave the same on both
+# lines. Pin the OUTCOME (DATE infers as DATE) rather than the mechanism: this
+# must hold because TryMakeProbeValue now enumerates DATE explicitly, not
+# because some other function's default case happened to throw.
+statement ok
+CREATE MACRO m_next_day(x) AS x + 1;
+
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_next_day'}, 'a', u)), func_dispatch(MAP{'a': 'm_next_day'}, 'a', u)
+FROM (VALUES (DATE '2024-01-01')) t(u);
+----
+DATE	2024-01-02
+
+# --- unresolved forwarded argument types are not judged ---
+# A bare NULL literal carries no type (SQLNULL), so no route can be judged
+# against it: VARCHAR, not a bind error and not INTEGER.
+query II
+SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', NULL)),
+       func_dispatch(MAP{'a': 'm_cat'}, 'a', NULL) IS NULL;
+----
+VARCHAR	true
+
+# A prepared-statement parameter is UNKNOWN at bind time, the same placeholder
+# case as a macro body's parameter. This used to be a bind error.
+statement ok
+PREPARE dispatch_param AS SELECT typeof(func_dispatch(MAP{'a': 'm_cat'}, 'a', ?));
+
+query I
+EXECUTE dispatch_param('x');
+----
+VARCHAR

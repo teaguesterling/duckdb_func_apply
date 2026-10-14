@@ -1,0 +1,168 @@
+# name: test/sql/func_dispatch.test
+# description: func_dispatch map-driven dynamic dispatch
+# group: [sql]
+
+require func_apply
+
+statement ok
+CREATE MACRO route_git(p) AS 'GIT:' || p;
+
+statement ok
+CREATE MACRO route_http(p) AS 'HTTP:' || p;
+
+statement ok
+CREATE MACRO route_any(p) AS 'ANY:' || p;
+
+# --- happy path: both branches of a two-entry table ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, 'git', 'a.git');
+----
+GIT:a.git
+
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, 'https', 'b');
+----
+HTTP:b
+
+# --- miss -> NULL ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git'}, 's3', 'x') IS NULL;
+----
+true
+
+# --- NULL key -> NULL ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git'}, NULL, 'x') IS NULL;
+----
+true
+
+# --- empty map -> NULL ---
+query I
+SELECT func_dispatch(MAP{}::MAP(VARCHAR,VARCHAR), 'git', 'x') IS NULL;
+----
+true
+
+# --- '*' wildcard fallback on a miss ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', '*': 'route_any'}, 's3', 'x');
+----
+ANY:x
+
+# --- an exact hit beats the wildcard ---
+query I
+SELECT func_dispatch(MAP{'git': 'route_git', '*': 'route_any'}, 'git', 'x');
+----
+GIT:x
+
+# the exact key wins even when '*' is written first in the map literal
+query I
+SELECT func_dispatch(MAP{'*': 'route_any', 'git': 'route_git'}, 'git', 'x');
+----
+GIT:x
+
+# --- per-row dispatch from a column ---
+query II
+SELECT k, func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, k, 'v')
+FROM (VALUES ('git'), ('https')) t(k) ORDER BY k;
+----
+git	GIT:v
+https	HTTP:v
+
+# --- positional arg forwarding (multi-arg target) ---
+statement ok
+CREATE MACRO route_two(a, b) AS 'TWO:' || a || '/' || b;
+
+query I
+SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', 'x', 'y');
+----
+TWO:x/y
+
+# --- alias names are IGNORED: forwarding is purely positional ---
+# Measured: this is NOT TWO:x/y. 'y' is forwarded to a (1st forwarded
+# position) and 'x' to b (2nd forwarded position), regardless of the
+# b := / a := labels -- proving aliases are accepted but discarded, and
+# the value lands by position alone, the same way apply() forwards args.
+query I
+SELECT func_dispatch(MAP{'k': 'route_two'}, 'k', b := 'y', a := 'x');
+----
+TWO:y/x
+
+# --- NULL forwarding is not short-circuited ---
+# Pins the SPECIAL_HANDLING null-handling flag: without it, DuckDB would
+# auto-propagate a NULL forwarded argument to a NULL result before the
+# function ever runs. m_coalesce_null returns a non-NULL value for a NULL
+# input, so a short-circuited (auto-NULLed) call would wrongly return NULL
+# and this assertion would catch it.
+statement ok
+CREATE MACRO m_coalesce_null(x) AS COALESCE(x, 'MISSING');
+
+query I
+SELECT func_dispatch(MAP{'k': 'm_coalesce_null'}, 'k', NULL);
+----
+MISSING
+
+# --- errors ---
+statement error
+SELECT func_dispatch(MAP{'git': 'no_such_function_xyz'}, 'git', 'x');
+----
+does not exist
+
+statement error
+SELECT func_dispatch(MAP{'git': 'duckdb_functions'}, 'git', 1);
+----
+apply_table
+
+statement error
+SELECT func_dispatch(MAP{'git': 'route_git'});
+----
+No function matches
+
+# --- wrapping func_dispatch in a macro: the primary documented pattern ---
+#
+# This is what README and docs/examples.md teach, and it regressed once: DuckDB
+# validates a macro body eagerly, so at CREATE MACRO time `filename` is still an
+# unresolved parameter (measured as LogicalTypeId::UNKNOWN). Binding each route
+# against it necessarily fails, and the arity check mistook that for "this route
+# cannot accept the forwarded arguments" and rejected the macro at CREATE time
+# with "candidate 'route_git' cannot be called with the forwarded arguments".
+# Both halves matter: the CREATE must succeed AND the result must be right.
+statement ok
+CREATE MACRO normalize_name(filename) AS
+  func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, 'git', filename);
+
+query I
+SELECT normalize_name('a.git');
+----
+GIT:a.git
+
+query I
+SELECT typeof(normalize_name('a.git'));
+----
+VARCHAR
+
+# and through the wrapper with a non-foldable argument
+query II
+SELECT normalize_name(u), typeof(normalize_name(u)) FROM (VALUES ('b.git')) t(u);
+----
+GIT:b.git	VARCHAR
+
+# A wrapper macro that forwards the KEY as well, so neither the key nor the
+# argument is known when the body is validated.
+statement ok
+CREATE MACRO normalize_by(scheme, filename) AS
+  func_dispatch(MAP{'git': 'route_git', 'https': 'route_http'}, scheme, filename);
+
+query II
+SELECT normalize_by('git', 'a'), normalize_by('https', 'b');
+----
+GIT:a	HTTP:b
+
+# Declining to judge unknown-typed arguments must NOT also disable the check
+# when the types ARE known: this is still a loud bind error.
+statement ok
+CREATE MACRO route_two_arg(a, b) AS a || b;
+
+statement error
+SELECT func_dispatch(MAP{'one': 'route_git', 'two': 'route_two_arg'}, 'one', 'x');
+----
+cannot be called with the forwarded arguments

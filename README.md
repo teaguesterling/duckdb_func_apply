@@ -10,6 +10,7 @@ The FuncApply extension provides dynamic function invocation capabilities for Du
 - Pass arguments dynamically using `apply_with()`
 - Call table functions dynamically using `apply_table()` and `apply_table_with()`
 - Check if functions exist with `function_exists()`
+- Route a value to one of several functions with `func_dispatch()`
 
 This is useful for data-driven transformations, dynamic SQL generation, and building flexible data pipelines.
 
@@ -58,8 +59,13 @@ SELECT apply('round', 3.14159, 2);        -- 3.14
 SELECT apply('list_sum', [1, 2, 3, 4]);   -- 10
 SELECT apply('list_reverse', [1, 2, 3]); -- [3, 2, 1]
 
--- Named parameters are supported
+-- Named arguments are ACCEPTED, but forwarding is purely positional: the
+-- alias names are ignored, and args are matched by position alone. This
+-- example "works" only because start:=7, length:=5 happens to match
+-- substr's declared positional order (string, start, length):
 SELECT apply('substr', 'hello world', start := 7, length := 5);  -- world
+-- Reorder the aliases and the result reorders too, proving it:
+SELECT apply('substr', 'hello world', length := 5, start := 7);  -- o world
 ```
 
 ### `apply_with(func_name, args, kwargs)`
@@ -83,6 +89,80 @@ for forward compatibility, but passing a non-empty struct raises
 `kwargs (named parameters) are not yet supported`. Use `apply()` with named
 arguments (`apply('substr', s, start := 7, length := 5)`) for scalar named
 parameters. (`apply_table_with` *does* support `kwargs` — see below.)
+
+### `func_dispatch(routes, key, ...args)`
+
+Dispatches to the function named by `routes[key]`, forwarding `...args`.
+
+```sql
+LOAD urlpattern;
+
+CREATE MACRO get_git_object_path(p) AS regexp_replace(p, '^git://', 'GIT:');
+CREATE MACRO get_http_path(p) AS regexp_replace(p, '^https?://', 'HTTP:');
+
+SELECT func_dispatch(MAP{'git': 'get_git_object_path', 'https': 'get_http_path'},
+                      urlpattern_protocol(filename),
+                      filename) AS cleaned
+FROM (VALUES ('git://host/a/b.git')) t(filename);
+-- Result: GIT:host/a/b.git
+```
+
+You can wrap it in a convenience macro that forwards the wrapping macro's own
+parameter:
+
+```sql
+CREATE MACRO normalize_name(filename) AS
+  func_dispatch(MAP{'git': 'get_git_object_path', 'https': 'get_http_path'},
+                'git',
+                filename);
+
+SELECT normalize_name('git://host/a/b.git');
+-- Result: GIT:host/a/b.git
+```
+
+A macro's body is validated when the macro is *created*, and at that point
+`filename` has no concrete type yet. `func_dispatch` detects that the forwarded
+argument types are unknown and skips its per-candidate bind check entirely,
+falling back to `VARCHAR` — it cannot judge whether a route accepts an argument
+it knows nothing about. Call sites that forward concrete types still get the
+full check and the real return type.
+
+Unlike `apply()` with a dynamic name, `func_dispatch` binds every function in
+the routing map at plan time, so the result keeps its **real type**:
+
+```sql
+CREATE MACRO pair(x) AS [x, x];
+
+-- apply() with a dynamic name returns the STRING '[7, 7]':
+SELECT typeof(apply(MAP{'a':'pair'}[k], 7)) FROM (VALUES ('a')) t(k);  -- VARCHAR
+
+-- func_dispatch returns a real list:
+SELECT typeof(func_dispatch(MAP{'a':'pair'}, 'a', 7));                 -- INTEGER[]
+```
+
+| behavior | result |
+|----------|--------|
+| `key` missing from `routes` | `NULL` |
+| `key` is `NULL` | `NULL` |
+| `routes` contains a `'*'` entry | used when `key` is missing |
+| candidates return different types | unified where an implicit cast exists (`INTEGER`+`BIGINT` -> `BIGINT`); a bind error otherwise, which includes `INTEGER`+`VARCHAR` — true even if one candidate's body is a bare literal |
+| a candidate can't be bound against the forwarded arguments (e.g. wrong arity) | a bind error for the **whole call**, no matter what the other candidates agree on — every route in a constant routing map must accept the forwarded arguments |
+| a forwarded argument has no concrete type yet (a macro body's own parameter, a prepared-statement `?`, a bare `NULL`) | no candidate is judged; the return type falls back to `VARCHAR` |
+| a candidate is callable but its return type can't be determined (its body folds to `NULL`) | the return type falls back to `VARCHAR`; not an error |
+| `routes` is not a constant | works, but the return type falls back to `VARCHAR` |
+
+**Watch the key extractor.** The map key must match exactly what the extractor
+produces. For a URL these differ:
+
+| expression | value for `git://host/x` |
+|------------|--------------------------|
+| `urlpattern_protocol(p)` | `git` |
+| `url_parse(p).protocol` | `git:` |
+
+A key of `'git://'` matches neither and silently returns `NULL`.
+
+The routing map is checked against the session [security policy](#security-model)
+at run time, including the `'*'` entry.
 
 ### `apply_table(func_name, ...args)`
 

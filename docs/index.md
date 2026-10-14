@@ -44,6 +44,7 @@ JOIN transforms ON data.type = transforms.data_type;
 | [`apply_table()`](api.md#apply_table) | Call a table function by name with arguments |
 | [`apply_table_with()`](api.md#apply_table_with) | Call a table function with args as a list |
 | [`function_exists()`](api.md#function_exists) | Check if a function exists |
+| [`func_dispatch()`](api.md#func_dispatch) | Dispatch to a function named by a routing map, keeping the real return type |
 
 ## Contents
 
