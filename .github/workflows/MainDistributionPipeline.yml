@@ -174,7 +174,6 @@ jobs:
     env:
       DUCKDB_VERSION: v2.0.0
       DUCKDB_NEXT: v2.0.1-alpha50125
-      DUCKDB_VARIANT: v1.5.6
     steps:
       - uses: actions/checkout@v4
       - name: Assert both the stable and v2.0 lines are built
@@ -183,10 +182,8 @@ jobs:
           n=$(grep -c "duckdb_version: ${DUCKDB_VERSION}$" "$wf" || true)
           m=$(grep -c "duckdb_version: ${DUCKDB_NEXT}$" "$wf" || true)
           [ "$n" -ge 1 ] || { echo "::error::no job builds the stable line duckdb_version: ${DUCKDB_VERSION}"; exit 1; }
-          v=$(grep -c "duckdb_version: ${DUCKDB_VARIANT}$" "$wf" || true)
           [ "$m" -ge 1 ] || { echo "::error::no job builds the v2.0 next line duckdb_version: ${DUCKDB_NEXT}"; exit 1; }
-          [ "$v" -ge 1 ] || { echo "::error::no job builds the variant line duckdb_version: ${DUCKDB_VARIANT}"; exit 1; }
-          echo "drift guard OK: shipping=${DUCKDB_VERSION} (${n} job(s)), next=${DUCKDB_NEXT} (${m} job(s)), variant=${DUCKDB_VARIANT} (${v} job(s))"
+          echo "drift guard OK: shipping=${DUCKDB_VERSION} (${n} job(s)), next=${DUCKDB_NEXT} (${m} job(s))"
 
   # Shipping build: targets the released, loadable v2.0.0 TAG, pinned by an
   # explicit hex commit rather than by a branch name. Hex is load-bearing --
@@ -208,22 +205,10 @@ jobs:
       # variant leg below deliberately carries no test_config.
       test_config: '{"test_env_variables": {"T": "--test-flags \"--require func_apply\" \"test/*\""}}'
 
-  # The OLD shipping line, kept as a variant so the promote drops no v1.5
-  # coverage. NO test_config here on purpose: `T ?=` is absent from
-  # duckdb_extension.Makefile on v1.5-variegata, so test_env_variables is
-  # silently ignored and a guard written here would look active while doing
-  # nothing.
-  duckdb-variegata-build:
-    name: Build extension binaries (DuckDB v1.5 variant)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
-    with:
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5-variegata
-      extension_name: func_apply
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
       duckdb_version: v2.0.0
       ci_tools_version: v2.0-cyanoptera
